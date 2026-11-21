@@ -28,7 +28,8 @@ was left out. Lower is better.
    about twice as fast as JSON. CPU time counts towards the score.
 2. **Per patch (at run time, `app/candidates.py`):**
    - Python files: compare old and new syntax trees, ignoring comments and
-     docstrings. No real change → no tests.
+     docstrings, and treating `x is None` / `x == None` (and `is` / `==`
+     against an enum member) as the same. No real change → no tests.
    - A changed function → the tests that ran its body.
    - Import-time changes (class attributes, module constants, new methods,
      functions that run during import):
@@ -57,11 +58,12 @@ costs about 37 s. So whenever the selector is unsure, it runs more.
 | Starter (every test, 3 workers) | ~1,209 s | 1,614.1 s |
 | v1: line coverage only | 177.2 s, 0 misses | 764.6 s (2 misses) |
 | v2: import-time, setup and dialect rules | 234.8 s, 0 misses | 305.1 s (0 misses) |
-| v3: narrower name rules, ~3x less CPU | 192.9 s, 0 misses | |
+| v3: narrower name rules, ~3x less CPU | 192.9 s, 0 misses | 265.8 s (0 misses) |
+| v4: equivalent rewrites (`is` vs `==`) select nothing | 142.6 s, 0 misses | |
 
-Also checked against synthetic commits (random edits to class attributes,
-module constants, functions and fixtures, labelled by running the real test
-suite): no misses.
+Also checked against 44 synthetic commits (random edits to class attributes,
+module constants, functions and fixtures, plus `is` → `==` rewrites),
+labelled by running the real test suite: no misses.
 
 ## Run
 
