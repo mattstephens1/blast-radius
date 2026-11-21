@@ -30,6 +30,32 @@ import zlib
 
 import pytest
 
+# Process pools (test_optimizer, test_executor) would run tests' work in fresh
+# processes this plugin cannot see into: swap them for threads that still
+# pickle arguments and results, as tools/coverage_plugin.py does.
+import concurrent.futures as _cf
+import concurrent.futures.process as _cfp
+import multiprocessing as _mp
+import multiprocessing.pool as _mpp
+
+
+class _InProc(_cf.ThreadPoolExecutor):
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
+        super().__init__(max_workers=max_workers, initializer=initializer, initargs=initargs)
+
+    def submit(self, fn, *args, **kwargs):
+        fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+
+        def run():
+            return pickle.loads(pickle.dumps(fn(*args, **kwargs)))
+
+        return super().submit(run)
+
+
+_cf.ProcessPoolExecutor = _InProc
+_cfp.ProcessPoolExecutor = _InProc
+_mp.Pool = _mpp.ThreadPool  # in case a test uses multiprocessing.Pool
+
 OUT = os.environ.get("READS_OUT", "/tmp/reads")
 os.makedirs(OUT, exist_ok=True)
 ALL = object()     # "the whole container was read"; written out as ALL_KEY
