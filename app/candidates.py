@@ -158,7 +158,19 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
 
     for q, node in d.functions:
         lo, hi = analyse.body_range(node)
-        sel |= maps.covering(path, lo, hi)
+        if changed_ranges:
+            in_func = [r[0] for r in changed_ranges if lo <= r[0] <= hi]
+            if in_func:
+                stmt_ranges = analyse.stmt_ranges_for_lines(old, in_func, lo, hi)
+                if stmt_ranges:
+                    for s_lo, s_hi in stmt_ranges:
+                        sel |= maps.covering(path, s_lo, s_hi)
+                else:
+                    sel |= maps.covering(path, lo, hi)
+            else:
+                sel |= maps.covering(path, lo, hi)
+        else:
+            sel |= maps.covering(path, lo, hi)
         if maps.runs_at_import(path, lo, hi):
             broad = True
             notes.append(("function runs at import", q))
@@ -181,6 +193,17 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
         notes.append(("specific dialect setting", sorted(specific)))
         if sel:
             fam, broad = None, False   # precise enough: do not widen to the whole dialect
+    elif d.classes and fam is not None and d.class_names and not d.class_unnamed \
+            and not d.added and not d.module_names and not d.module_other \
+            and not any(maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions):
+        # e.g. SHOW_PARSERS in SingleStore: not specific enough for the tight check above,
+        # but we can still narrow to tests that actually ran code reading these names
+        refs = maps.referencing(d.class_names)
+        candidate = fam & refs
+        if candidate:
+            sel |= candidate
+            notes.append(("dialect class attrs narrow", sorted(d.class_names)))
+            fam, broad = None, False
     elif d.classes and fam is None:
         # a shared class changed at import time: follow uses of the class and of specific names
         names = specific | {q.rsplit(".", 1)[-1] for q, _ in d.classes}
@@ -197,8 +220,9 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
         notes.append(("added", q))
         broad = True
     if d.module_names:
-        sel |= maps.covering(path)
-        if fam is None:
+        if fam is not None:
+            sel |= maps.covering(path)
+        else:
             sel |= maps.referencing(d.module_names)
         notes.append(("module names", sorted(d.module_names)))
         broad = True
@@ -215,9 +239,14 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
             sel |= fam
         elif d.module_names or d.added or any(maps.runs_at_import(path, *analyse.body_range(n))
                                               for _, n in d.functions):
-            # shared machinery that runs at import: anything could depend on it
-            notes.append(("import-time core change -> all", path))
-            return set(maps.all)
+            if d.module_names and not d.added and not any(
+                    maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions):
+                # Only module-level names changed: trust referencing to find all relevant tests
+                notes.append(("module names core", sorted(d.module_names)))
+            else:
+                # shared machinery that runs at import: anything could depend on it
+                notes.append(("import-time core change -> all", path))
+                return set(maps.all)
     return sel
 
 
@@ -227,6 +256,10 @@ def test_file_change(path, old, new, maps, notes):
     also reaches every test file that imports this one."""
     own = maps.by_file.get(path)
     if not own or not path.split("/")[-1].startswith("test_"):
+        imp = importers(path, maps)
+        if imp:
+            notes.append(("test helper -> importers", path, len(imp)))
+            return imp
         notes.append(("test helper -> all", path))
         return set(maps.all)
     d = analyse.diff_python(old, new)

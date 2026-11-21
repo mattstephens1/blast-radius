@@ -111,6 +111,35 @@ def body_range(node):
     return body[0].lineno, node.end_lineno
 
 
+def stmt_ranges_for_lines(source, changed_lines, func_lo, func_hi):
+    """Statement ranges covering the given changed lines within a function body.
+
+    Returns a list of (lo, hi) pairs — the innermost statements that contain
+    each changed line — or None if the source does not parse.  Using statement
+    ranges rather than the full function body avoids pulling in tests that only
+    ran other parts of the same function.
+    """
+    if not changed_lines:
+        return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    result = set()
+    for ln in changed_lines:
+        if not (func_lo <= ln <= func_hi):
+            continue
+        best = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.stmt) and func_lo <= node.lineno and node.end_lineno <= func_hi:
+                if node.lineno <= ln <= node.end_lineno:
+                    if best is None or node.lineno >= best.lineno:
+                        best = node
+        if best:
+            result.add((best.lineno, best.end_lineno))
+    return list(result) if result else None
+
+
 class Diff:
     """What changed between two versions of one file."""
 
