@@ -418,6 +418,13 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
             notes.append(("class change with no known users -> all", path))
             return set(maps.all)
         sel |= refs
+        if path.startswith("sqlglot/expressions/"):
+            # expressions are also built from SQL text by name (APPROX_DISTINCT(...) ->
+            # ApproxDistinct.from_arg_list) in generic code that never names the class
+            sql = sql_names_of({q.rsplit(".", 1)[-1] for q, _ in d.classes}, maps)
+            by_sql = tests_naming(sql, maps, ignore_case=True) | fixture_readers(sql, maps)
+            notes.append(("expression sql names", sorted(sql)[:6], len(by_sql)))
+            sel |= by_sql
     for q in d.added:
         owner = q.rsplit(".", 1)[0] if "." in q else ""
         node = d.units.get(owner)
@@ -482,11 +489,57 @@ def test_file_change(path, old, new, maps, notes):
     return set(own) if only_tests else set(own) | importers(path, maps)
 
 
-def tests_naming(names, maps):
+_CAMEL = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def sql_names_of(classes, maps):
+    """SQL names that build these expression classes or their subclasses: their
+    _sql_names (or the derived NAME), and dialect parser entries such as
+    "NDV": exp.ApproxDistinct.from_arg_list or "X": build_x(exp.ApproxDistinct)."""
+    src = maps.source_lines()
+    text = "\n".join("\n".join(v) for v in src.values())
+    todo, found = list(classes), set(classes)
+    while todo:  # subclasses inherit the change
+        cls = todo.pop()
+        for m in re.finditer(r"^\s*class (\w+)\(([^)]*)\)", text, re.M):
+            if m.group(1) not in found and re.search(r"\b%s\b" % re.escape(cls), m.group(2)):
+                found.add(m.group(1))
+                todo.append(m.group(1))
+    names = set()
+    for cls in found:
+        names.add(_CAMEL.sub("_", cls).upper())
+        m = re.search(r"^\s*class %s\(.*?(?=^\s*class |\Z)" % re.escape(cls), text, re.M | re.S)
+        if m:
+            sn = re.search(r"_sql_names\s*=\s*\[([^\]]*)\]", m.group(0))
+            if sn:
+                names |= set(re.findall(r"[\"']([^\"']+)[\"']", sn.group(1)))
+        for m in re.finditer(r"[\"']([A-Za-z0-9_]+)[\"']\s*:\s*[^\n]*\b%s\b" % re.escape(cls), text):
+            names.add(m.group(1))
+    return names
+
+
+def fixture_readers(names, maps):
+    """Tests that read a fixture file mentioning one of these names (any case)."""
+    word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(names))), re.I)
+    out = set()
+    for path, users in maps.opened.items():
+        p = maps.repo / path
+        if not p.exists():
+            out |= users  # fixture data is not shipped in the image: assume it might
+            continue
+        try:
+            if word.search(p.read_text(errors="replace")):
+                out |= users
+        except OSError:
+            out |= users
+    return out
+
+
+def tests_naming(names, maps, ignore_case=False):
     """Tests whose own code names one of these identifiers: the test method, or
     every test in the file (and its importers) when a helper names it."""
     import ast
-    word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(names))))
+    word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(names))), re.I if ignore_case else 0)
     out = set()
     for p in maps.repo.glob("tests/**/*.py"):
         text = p.read_text()

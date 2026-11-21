@@ -6,9 +6,9 @@ for p in "$@"; do
   id=$(basename "$p" .patch)
   rm -rf /work && cp -r /sqlglot /work && cd /work
   if [ -s "$p" ] && ! patch -p1 -s < "$p" >/dev/null 2>&1; then echo "$id PATCHFAIL"; continue; fi
-  timeout 1200 python -m pytest -q -p no:cacheprovider -n 3 -o addopts= tests -rfE 2>&1 | ids > /tmp/cand
+  timeout 1200 python -m pytest -q -p no:cacheprovider -n 3 -o addopts= --timeout=60 tests -rfE 2>&1 | ids > /tmp/cand
   if [ -s /tmp/cand ]; then
-    timeout 1200 python -m pytest -q -p no:cacheprovider -o addopts= -rfE $(cat /tmp/cand) 2>&1 | ids | sed "s/^/$id /"
+    timeout 1200 python -m pytest -q -p no:cacheprovider -o addopts= --timeout=60 -rfE $(cat /tmp/cand) 2>&1 | ids | sed "s/^/$id /"
   fi
   echo "$id DONE"
 done
