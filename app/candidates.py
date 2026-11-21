@@ -29,7 +29,10 @@ TPC_TESTS = {
 # narrowing import-time value changes by the changed names: small gain, not yet
 # verified against real test runs, so off
 NAME_NARROW = False
-TPC_WORTH_S = 8.0  # simulated seconds dropping them must save to pay for the check
+TPC_WORTH_S = 8.0
+# On the sample and the practice board the TPC check never paid for its CPU:
+# where those tests are selected they really fail. Off unless TPC_CHECK=1.
+TPC_ENABLED = os.environ.get("TPC_CHECK") == "1"  # simulated seconds dropping them must save to pay for the check
 IMPORT_BASELINE = Path(os.environ.get(
     "IMPORT_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "import_state.json"))
 
@@ -120,8 +123,18 @@ def _dialect_of(path):
     return None
 
 
+_SUBCLASS_CACHE = {}
+
+
 def _subclass_dialects(name, maps):
     """Dialects whose modules import this dialect's modules (e.g. redshift <- postgres)."""
+    if name in _SUBCLASS_CACHE:
+        return set(_SUBCLASS_CACHE[name])
+    _SUBCLASS_CACHE[name] = out = _find_subclass_dialects(name, maps)
+    return set(out)
+
+
+def _find_subclass_dialects(name, maps):
     found, todo = {name}, [name]
     src, exact = maps.source_lines(), maps.index()[0]
     while todo:
@@ -324,7 +337,10 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
             narrow |= maps.covering(path, lo, hi)
         own = []
         broad = python_change(path, old, new, maps, own, changed_ranges, new_lines)
-        structural = bool(d.classes or d.added or d.module_names or d.module_other)
+        # Shared code must always be checked: values derived from it elsewhere at import
+        # are invisible to the rules below (JSONFormat._sql_names feeds Parser.FUNCTIONS).
+        # A dialect's class settings are only read by its own family, which they cover.
+        structural = bool(d.classes or d.added or d.module_names or d.module_other) and fam is None
         if not structural and maps.seconds(broad - narrow) < CHECK_WORTH_S:
             notes.extend(own)
             return broad
@@ -499,8 +515,9 @@ def sql_names_of(classes, maps):
     """SQL names that build these expression classes or their subclasses: their
     _sql_names (or the derived NAME), and dialect parser entries such as
     "NDV": exp.ApproxDistinct.from_arg_list or "X": build_x(exp.ApproxDistinct)."""
-    src = maps.source_lines()
-    text = "\n".join("\n".join(v) for v in src.values())
+    if not hasattr(maps, "_all_text"):
+        maps._all_text = "\n".join("\n".join(v) for v in maps.source_lines().values())
+    text = maps._all_text
     todo, found = list(classes), set(classes)
     while todo:  # subclasses inherit the change
         cls = todo.pop()
@@ -524,16 +541,17 @@ def sql_names_of(classes, maps):
 def fixture_readers(names, maps):
     """Tests that read a fixture file mentioning one of these names (any case)."""
     word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(names))), re.I)
+    if not hasattr(maps, "_fixture_text"):
+        maps._fixture_text = {}
+        for path in maps.opened:
+            try:
+                maps._fixture_text[path] = (maps.repo / path).read_text(errors="replace")
+            except OSError:
+                maps._fixture_text[path] = None  # not shipped: assume it might mention them
     out = set()
     for path, users in maps.opened.items():
-        p = maps.repo / path
-        if not p.exists():
-            out |= users  # fixture data is not shipped in the image: assume it might
-            continue
-        try:
-            if word.search(p.read_text(errors="replace")):
-                out |= users
-        except OSError:
+        text = maps._fixture_text.get(path)
+        if text is None or word.search(text):
             out |= users
     return out
 
@@ -626,7 +644,7 @@ def candidates(patch_text, repo, maps):
         else:
             sel |= maps.all
             notes.append(("other file -> all", path))
-    if sel and checkable and overrides:
+    if sel and checkable and overrides and TPC_ENABLED:
         import split
 
         def cost(nums):

@@ -111,6 +111,23 @@ def body_range(node):
     return body[0].lineno, node.end_lineno
 
 
+_PARSED = {}
+
+
+def _parse_cached(source):
+    """ast.parse, remembered for the last few sources (one file is often asked about
+    once per changed function). Callers must not modify the tree."""
+    key = hash(source)
+    if key not in _PARSED:
+        if len(_PARSED) > 8:
+            _PARSED.clear()
+        try:
+            _PARSED[key] = ast.parse(source)
+        except SyntaxError:
+            _PARSED[key] = None
+    return _PARSED[key]
+
+
 def stmt_ranges_for_lines(source, changed_lines, func_lo, func_hi):
     """Statement ranges covering the given changed lines within a function body.
 
@@ -121,9 +138,8 @@ def stmt_ranges_for_lines(source, changed_lines, func_lo, func_hi):
     """
     if not changed_lines:
         return None
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_cached(source)
+    if tree is None:
         return None
     result = set()
     for ln in changed_lines:
