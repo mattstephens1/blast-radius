@@ -40,6 +40,10 @@ CANNOT_RUN = ("tests/test_optimizer.py", "tests/test_executor.py")
 TPC_WORTH_S = 8.0
 READS = Path(__file__).resolve().parent.parent / "maps" / "reads.pkl.z"
 DIFF_ITEMS = {}  # changed dict/set attribute -> its changed items, from the last import check
+# containers that sqlglot reads at run time through C fast paths the read map
+# cannot see (dialect.py: kwargs.keys() - self.SUPPORTED_SETTINGS); they are
+# followed by name as well. Found with tools/dev/c_reads.sh.
+READ_BY_C = {"SUPPORTED_SETTINGS"}
 # On the sample and the practice board the TPC check never paid for its CPU:
 # where those tests are selected they really fail. Off unless TPC_CHECK=1.
 TPC_ENABLED = os.environ.get("TPC_CHECK") == "1"  # simulated seconds dropping them must save to pay for the check
@@ -335,6 +339,8 @@ def selection_by_reads(changed, items, path, d, maps, notes):
     scalars = set()
     for key in changed:
         i = reads["keys"].get(key)
+        if key.rsplit(".", 1)[-1].split(":")[-1] in READ_BY_C:
+            scalars.add(key.rsplit(".", 1)[-1].split(":")[-1])
         if i is not None:
             if i in reads["collect"]:
                 notes.append(("read at collection", key))
