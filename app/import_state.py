@@ -16,12 +16,14 @@ import fails, the caller falls back to its broad rules.
     python import_state.py --baseline <repo> <out.json>   (image build)
     python import_state.py --check <repo> <baseline.json> (stdin: {path: source})
 """
+import enum
 import hashlib
 import importlib
 import importlib.abc
 import importlib.util
 import json
 import os
+import pickle
 import pkgutil
 import re
 import sys
@@ -103,6 +105,8 @@ class _Canon:
             return repr(obj)
         if isinstance(obj, type):
             return "<type %s.%s>" % (obj.__module__, obj.__qualname__)
+        if isinstance(obj, enum.Enum):
+            return "<enum %s.%s.%s>" % (type(obj).__module__, type(obj).__qualname__, obj.name)
         if isinstance(obj, types.ModuleType):
             return "<module %s>" % obj.__name__
         if isinstance(obj, (staticmethod, classmethod)):
@@ -158,12 +162,34 @@ class _Canon:
             return "<%s>" % tname
 
 
-def snapshot():
-    """key (module:attr or module:Class.attr) -> hash of its canonical form."""
+def item_key(item):
+    """A container item (dict key or set element) as a stable string."""
+    return _Canon()(item)
+
+
+CONTAINERS = (dict, set, frozenset)
+
+
+def _h(text):
+    return hashlib.blake2b(text.encode(), digest_size=12).hexdigest()
+
+
+def items_of(value, canon):
+    """A dict's or set's items: item key -> hash of the item's value ("" for sets)."""
+    if isinstance(value, dict):
+        return {canon(k): _h(canon(v)) for k, v in value.items()}
+    return {canon(x): "" for x in value}
+
+
+def snapshot(values=None):
+    """key (module:attr or module:Class.attr) -> hash of its canonical form.
+    values, if given, is filled with key -> value for container values."""
     canon, out = _Canon(), {}
 
     def put(key, value):
-        out[key] = hashlib.blake2b(canon(value).encode(), digest_size=12).hexdigest()
+        out[key] = _h(canon(value))
+        if values is not None and type(value) in CONTAINERS:
+            values[key] = value
 
     def walk_class(prefix, cls, seen):
         if cls in seen:
@@ -207,20 +233,35 @@ def main():
     mode, repo, path = sys.argv[1:4]
     if mode == "--baseline":
         import_all(repo)
+        values = {}
         with open(path, "w") as f:
-            json.dump(snapshot(), f)
+            json.dump(snapshot(values), f)
+        canon = _Canon()
+        with open(path + ".items", "wb") as f:  # per-item hashes of every container
+            pickle.dump({k: items_of(v, canon) for k, v in values.items()}, f, protocol=5)
         return
     overrides = json.load(sys.stdin)
+    values = {}
     try:
         import_all(repo, overrides)
-        now = snapshot()
+        now = snapshot(values)
     except BaseException as error:  # the patched package does not even import
         print(json.dumps({"ok": False, "error": repr(error)[:300]}))
         return
     with open(path) as f:
         base = json.load(f)
     changed = sorted(k for k in set(base) | set(now) if base.get(k) != now.get(k))
-    print(json.dumps({"ok": True, "changed": changed}))
+    # for a changed dict or set, which items changed (ALL_ITEMS if it is no longer one)
+    items = {}
+    if any(k in values for k in changed):
+        with open(path + ".items", "rb") as f:
+            base_items = pickle.load(f)
+        canon = _Canon()
+        for k in changed:
+            if k in values and k in base_items:
+                a, b = base_items[k], items_of(values[k], canon)
+                items[k] = sorted(i for i in set(a) | set(b) if a.get(i) != b.get(i))
+    print(json.dumps({"ok": True, "changed": changed, "items": items}))
 
 
 if __name__ == "__main__":

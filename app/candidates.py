@@ -38,6 +38,8 @@ RUN_WORTH_S = 1.0   # ...and leaving them out could save at least this much
 # test modules that need packages the image does not have (DuckDB, pandas)
 CANNOT_RUN = ("tests/test_optimizer.py", "tests/test_executor.py")
 TPC_WORTH_S = 8.0
+READS = Path(__file__).resolve().parent.parent / "maps" / "reads.pkl.z"
+DIFF_ITEMS = {}  # changed dict/set attribute -> its changed items, from the last import check
 # On the sample and the practice board the TPC check never paid for its CPU:
 # where those tests are selected they really fail. Off unless TPC_CHECK=1.
 TPC_ENABLED = os.environ.get("TPC_CHECK") == "1"  # simulated seconds dropping them must save to pay for the check
@@ -242,6 +244,8 @@ def import_state_diff(repo, overrides, notes):
         return None
     if result["changed"]:
         notes.append(("import state changed", result["changed"][:5]))
+    DIFF_ITEMS.clear()
+    DIFF_ITEMS.update(result.get("items") or {})
     return result["changed"]
 
 
@@ -306,6 +310,61 @@ def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
     return drop
 
 
+def _reads(maps):
+    if not hasattr(maps, "_reads"):
+        maps._reads = None
+        if READS.exists():
+            import pickle
+            import zlib
+            maps._reads = pickle.loads(zlib.decompress(READS.read_bytes()))
+    return maps._reads
+
+
+def selection_by_reads(changed, items, path, d, maps, notes):
+    """Tests that read what changed at import (see tools/read_plugin.py), or None
+    when something changed that the read map cannot follow.
+
+    changed: attribute keys whose value differs after the patched import
+    items:   for changed dicts and sets, which of their items differ
+    """
+    reads = _reads(maps)
+    if reads is None:
+        return None
+    out = set(reads["unknown"])
+    funcs = {q.rsplit(".", 1)[-1]: n for q, n in d.functions}
+    scalars = set()
+    for key in changed:
+        i = reads["keys"].get(key)
+        if i is not None:
+            if i in reads["collect"]:
+                notes.append(("read at collection", key))
+                return None
+            out |= reads["all"].get(i, frozenset())  # whole-container and scalar reads
+            by_item = reads["items"].get(i, {})
+            changed_items = items.get(key)
+            if changed_items is None:  # no item-level answer: every reader
+                for v in by_item.values():
+                    out |= v
+            else:
+                for item in changed_items:
+                    out |= by_item.get(item, frozenset())
+            continue
+        name = key.split(":", 1)[1].rsplit(".", 1)[-1]
+        if name in funcs:
+            # an edited function seen through a changed default or closure:
+            # every call runs its body
+            out |= maps.covering(path, *analyse.body_range(funcs[name]))
+        elif name.startswith("__"):
+            notes.append(("read map cannot follow", key))
+            return None
+        else:
+            scalars.add(name)  # a plain value: read only by lines that name it
+    if scalars:
+        out |= maps.referencing(scalars) | tests_naming(scalars, maps)
+    notes.append(("import-time reads", len(changed), sorted(scalars)[:4], len(out)))
+    return out
+
+
 def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None, import_diff=None):
     d = analyse.diff_python(old, new, {lo for lo, _ in changed_ranges} if changed_ranges else None, new_lines)
     if d is None:
@@ -361,6 +420,12 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
             # nothing built at import differs: only tests running the changed lines can notice
             notes.append(("import state unchanged", path))
             return narrow
+        if changed:
+            by_reads = selection_by_reads(changed, DIFF_ITEMS, path, d, maps, notes)
+            if by_reads is not None:
+                by_reads |= narrow
+                if maps.seconds(by_reads) < maps.seconds(broad):  # both are safe: take the cheaper
+                    return by_reads
         if changed and not d.added and NAME_NARROW:
             # specific values built at import changed (a DuckDB SQL template the parser
             # builds, Parser.SUPPORTS_DIRECTED_JOIN): add the tests that run code naming
