@@ -29,6 +29,11 @@ TPC_TESTS = {
 # narrowing import-time value changes by the changed names: small gain, not yet
 # verified against real test runs, so off
 NAME_NARROW = False
+RUN_TESTS = Path(__file__).resolve().with_name("run_tests.py")
+RUN_MAX_S = 1.0     # run the selected tests here when they take at most this long...
+RUN_WORTH_S = 1.0   # ...and leaving them out could save at least this much
+# test modules that need packages the image does not have (DuckDB, pandas)
+CANNOT_RUN = ("tests/test_optimizer.py", "tests/test_executor.py")
 TPC_WORTH_S = 8.0
 # On the sample and the practice board the TPC check never paid for its CPU:
 # where those tests are selected they really fail. Off unless TPC_CHECK=1.
@@ -653,4 +658,35 @@ def candidates(patch_text, repo, maps):
             return max(sum(dur[x] for x in w) for w in ws) + split.WORKER_MS * len(ws) if ws else 0
 
         sel -= tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost)
+    if sel and checkable and overrides and all(
+            f["new"].startswith("sqlglot/") and f["new"].endswith(".py") and f["old"] == f["new"]
+            for f in files):
+        sel -= passing_here(sel, overrides, repo, maps, notes)
     return sel, notes
+
+
+def passing_here(sel, overrides, repo, maps, notes):
+    """The selected tests that pass when run here against the patched source,
+    if running them is cheaper than the simulated time leaving them out saves."""
+    import split
+    files = {t["number"]: t["file"] for t in maps.tests}
+    runnable = {n for n in sel if files.get(n) not in CANNOT_RUN}
+    if not runnable or maps.seconds(runnable) > RUN_MAX_S:
+        return set()
+
+    def cost(nums):
+        dur = {n: int(maps.secs[n] * 1000 + 0.5) for n in nums}
+        ws = split.best_split(nums, dur)
+        return max(sum(dur[x] for x in w) for w in ws) + split.WORKER_MS * len(ws) if ws else 0
+
+    if cost(sel) - cost(sel - runnable) < RUN_WORTH_S * 1000:
+        return set()
+    ids = {t["number"]: t["id"] for t in maps.tests}
+    result = _run_json([RUN_TESTS, repo], {"overrides": overrides, "tests": [ids[n] for n in sorted(runnable)]},
+                       notes, "test run", 20)
+    if not result:
+        return set()
+    by_id = {v: k for k, v in ids.items()}
+    passed = {by_id[t] for t in result.get("passed", ()) if t in by_id}
+    notes.append(("ran here", len(runnable), "passed", len(passed), "failed", len(result.get("failed", ()))))
+    return passed
