@@ -12,34 +12,49 @@ was left out. Lower is better.
 ## Approach
 
 1. **Coverage map (built once, offline).** Run sqlglot's suite at the pinned
-   commit under `coverage`, switching context per test, and record which source
-   lines each test executes and which fixture files it opens
-   (`tools/coverage_plugin.py`, `tools/make_map.py`). The optimizer and executor
-   tests use process pools, which coverage can't see into, so during mapping
-   the pools are swapped for threads that still pickle arguments and results.
-   That way the serialisation code paths get recorded too. The map is stored
-   compressed in `maps/` (~0.5 MB).
+   commit under `coverage`, switching context for each test and phase
+   (setup / call / teardown), and record which source lines each test
+   executes and which fixture files it opens (`tools/coverage_plugin.py`,
+   `tools/make_map.py`). Details that matter:
+   - The optimizer and executor tests use process pools, which coverage can't
+     see into, so during mapping the pools become threads that still pickle
+     arguments and results.
+   - Lines and files used in `setUpClass` belong to the whole test class, not
+     just the test that happened to run first.
+   - Lines that only run while sqlglot is being imported are kept separately.
+   - For each dialect, the tests that name it (in their own code or in a
+     fixture they read) are recorded.
+   The map is stored compressed in `maps/` (~0.5 MB).
 2. **Per patch (at run time, `app/candidates.py`):**
-   - Python files: parse old and new code into syntax trees. If the trees are
-     identical (comment/whitespace-only edit), select nothing.
-   - Changed functions: select tests that executed any line of them.
-   - Import-time changes (class attributes, constants, new methods): select
-     tests that executed that class. For a dialect, also select every test
-     that touched any of that dialect's modules.
-   - Fixture files: the tests that opened them. Test files: all their tests.
-   - Anything unrecognised, a syntax error or a crash: run everything (never
-     miss).
-3. **Split (`app/split.py`):** longest-test-first onto the least-loaded worker,
-   trying 1 to 8 workers and keeping the cheapest.
+   - Python files: compare old and new syntax trees, ignoring comments and
+     docstrings. No real change → no tests.
+   - A changed function → the tests that ran its body.
+   - Import-time changes (class attributes, module constants, new methods,
+     functions that run during import):
+     - in a dialect → every test that touches that dialect, the dialects built
+       on it (postgres → redshift) and code elsewhere that names it;
+     - in shared code → every test that runs a line naming the changed thing,
+       or every test if that can't be pinned down.
+   - Fixture files → the tests that read them. Test files → that file's tests,
+     plus files importing it if shared code (e.g. `Validator`) changed.
+   - Anything unrecognised, a syntax error or a crash → run everything.
+3. **Split (`app/split.py`):** longest test first onto the least-loaded
+   worker, trying 1 to 8 workers and keeping the cheapest.
 
-## Result (30 sample commits, local scorer)
+The guiding trade-off: a missed failing test costs 300 s, running every test
+costs about 37 s. So whenever the selector is unsure, it runs more.
 
-| Version | Simulated seconds | Misses |
+## Results
+
+| Version | Sample (30 commits) | Practice board |
 | --- | --- | --- |
-| Starter (every test, 3 workers) | ~1,209 | 0 |
-| This selector | 177.2 | 0 |
+| Starter (every test, 3 workers) | ~1,209 s | 1,614.1 s |
+| v1: line coverage only | 177.2 s, 0 misses | 764.6 s (2 misses) |
+| v2: import-time, setup and dialect rules | 234.8 s, 0 misses | |
 
-The selector itself takes about 3 CPU seconds for the whole batch.
+Also checked against synthetic commits (random edits to class attributes,
+module constants, functions and fixtures, labelled by running the real test
+suite): no misses.
 
 ## Run
 

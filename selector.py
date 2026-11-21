@@ -5,13 +5,16 @@ coverage map built once from the pinned sqlglot commit (see tools/build_map.py):
 
 * Python files in sqlglot/: compare the old and new syntax trees. Comment or
   docstring-only edits change nothing, so they select nothing. Otherwise every
-  changed function selects the tests that ran any of its lines. Changes made
-  at import time (class attributes, module constants, new methods) select the
-  tests that ran any line of that class, plus, for a dialect, every test that
-  ran any of that dialect's modules.
+  changed function selects the tests that ran any of its lines.
+* Changes that take effect at import time (class attributes, module
+  constants, new methods, functions that run while sqlglot is imported) also
+  select every test that ran a line mentioning the changed name, and, for a
+  dialect, every test that ran any of that dialect's modules. In shared core
+  modules they select every test.
 * Fixture files: the tests that opened that file.
 * Test files: every test in that file.
 * Anything we cannot reason about: every test (safe, never misses).
+See app/candidates.py for the exact rules.
 
 The selected tests are then split across up to 8 workers, trying each worker
 count and keeping the cheapest (busiest worker + 2 s per worker).
@@ -43,7 +46,12 @@ def load_maps(tests):
         f: {ln: [to_num[i] for i in idx if to_num[i] is not None] for ln, idx in m.items()}
         for f, m in raw["lines"].items()
     }
-    return C.Maps(lines, raw["opened"], tests)
+    opened = {
+        path: {number_by_id[tid] for tid in tids if tid in number_by_id}
+        for path, tids in raw["opened"].items()
+    }
+    return C.Maps(lines, raw["import_lines"], opened, raw["unattributed"], tests, REPO,
+                  raw.get("mentions"))
 
 
 def main():
