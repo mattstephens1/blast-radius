@@ -104,6 +104,7 @@ def _subclass_dialects(name, maps):
 
 
 _FAMILY_CACHE = {}
+_FAM_COV_CACHE = {}  # name -> covering-only subset of family (no mentions/borrowers)
 
 
 def family(path, maps):
@@ -118,13 +119,32 @@ def family(path, maps):
     if name in _FAMILY_CACHE:
         return set(_FAMILY_CACHE[name])
     out = set()
+    cov = set()
     for dialect in _subclass_dialects(name, maps):
         for d in FAMILY_DIRS:
-            out |= maps.covering(f"sqlglot/{d}/{dialect}.py")
+            c = maps.covering(f"sqlglot/{d}/{dialect}.py")
+            out |= c
+            cov |= c
         out |= set(maps.mentions.get(dialect, ()))
         out |= _borrowers(dialect, maps)
     _FAMILY_CACHE[name] = out
+    _FAM_COV_CACHE[name] = cov
     return set(out)
+
+
+def family_covering(path, maps):
+    """Tests that ran any line in this dialect family's source files.
+
+    Subset of family(): excludes mentions and borrowers. Safe for pure class
+    attribute changes where only dialect-specific runtime code reads the attr.
+    Returns None for non-dialect files.
+    """
+    name = _dialect_of(path)
+    if name is None or name == "dialect":
+        return None
+    if name not in _FAM_COV_CACHE:
+        family(path, maps)  # populate cache
+    return set(_FAM_COV_CACHE.get(name, ()))
 
 
 def _borrowers(dialect, maps):
@@ -187,22 +207,37 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
     if d.classes and fam is not None and d.class_names and specific == d.class_names \
             and not d.class_unnamed and not d.added and not d.module_names and not d.module_other \
             and not any(maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions):
-        # e.g. WEEK_OFFSET in TSQL: tests that use tsql *and* run code reading WEEK_OFFSET
+        # e.g. WEEK_OFFSET in TSQL: narrow by both referencing and family_covering, pick smaller
         refs = maps.referencing(specific)
-        sel |= fam & refs
-        notes.append(("specific dialect setting", sorted(specific)))
+        candidate_refs = fam & refs
+        fcov = family_covering(path, maps) or set()
+        use_cov = fcov and (not candidate_refs or len(fcov) < len(candidate_refs))
+        best = fcov if use_cov else candidate_refs
+        sel |= best
+        notes.append(("dialect covering narrow" if use_cov else "specific dialect setting",
+                      _dialect_of(path) if use_cov else sorted(specific)))
         if sel:
             fam, broad = None, False   # precise enough: do not widen to the whole dialect
     elif d.classes and fam is not None and d.class_names and not d.class_unnamed \
             and not d.added and not d.module_names and not d.module_other \
             and not any(maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions):
-        # e.g. SHOW_PARSERS in SingleStore: not specific enough for the tight check above,
-        # but we can still narrow to tests that actually ran code reading these names
+        # e.g. SHOW_PARSERS / KEYWORDS: narrow to tests that actually ran dialect code.
+        # Try two independent subsets of fam and pick the smaller:
+        # (1) fam & refs(names): tests that ran code mentioning the changed names
+        # (2) family_covering: tests that ran any line in the dialect family's source files
+        # family_covering is safe for pure attr changes: a failing test must call dialect-
+        # specific code, which lives in the dialect's own files.
         refs = maps.referencing(d.class_names)
-        candidate = fam & refs
-        if candidate:
-            sel |= candidate
-            notes.append(("dialect class attrs narrow", sorted(d.class_names)))
+        candidate_refs = fam & refs
+        fcov = family_covering(path, maps) or set()
+        use_cov = fcov and (not candidate_refs or len(fcov) < len(candidate_refs))
+        best = fcov if use_cov else candidate_refs
+        if best:
+            sel |= best
+            if use_cov:
+                notes.append(("dialect covering narrow", _dialect_of(path)))
+            else:
+                notes.append(("dialect class attrs narrow", sorted(d.class_names)))
             fam, broad = None, False
     elif d.classes and fam is None:
         # a shared class changed at import time: follow uses of the class and of specific names
