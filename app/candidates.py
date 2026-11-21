@@ -30,6 +30,9 @@ TPC_TESTS = {
 # verified against real test runs, so off
 NAME_NARROW = False
 RUN_TESTS = Path(__file__).resolve().with_name("run_tests.py")
+# On the practice board running tests here cost 4.4 s CPU and saved nothing:
+# there, the few selected tests almost always really fail. Off unless RUN_TESTS=1.
+RUN_ENABLED = os.environ.get("RUN_TESTS") == "1"
 RUN_MAX_S = 1.0     # run the selected tests here when they take at most this long...
 RUN_WORTH_S = 1.0   # ...and leaving them out could save at least this much
 # test modules that need packages the image does not have (DuckDB, pandas)
@@ -42,6 +45,10 @@ IMPORT_BASELINE = Path(os.environ.get(
     "IMPORT_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "import_state.json"))
 
 CHECK_WORTH_S = 3.0  # test seconds an import-state check must be able to save
+
+# files outside sqlglot/ and tests/ that a test reads, and the tests that read them
+PACKAGING = ("setup.py", "setup.cfg", "pyproject.toml", "MANIFEST.in", "sqlglotc", "requirements.txt")
+PACKAGING_TESTS = ("tests/test_sqlglotc.py", "tests/test_build.py")
 
 FAMILY_DIRS = ("dialects", "parsers", "generators", "tokenizers", "typing")
 BIG = 10**7
@@ -316,7 +323,7 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
         if changed_ranges:
             in_func = [r[0] for r in changed_ranges if lo <= r[0] <= hi]
             if in_func:
-                stmt_ranges = analyse.stmt_ranges_for_lines(old, in_func, lo, hi)
+                stmt_ranges = analyse.stmt_ranges_in(node, in_func)
                 if stmt_ranges:
                     for s_lo, s_hi in stmt_ranges:
                         sel |= maps.covering(path, s_lo, s_hi)
@@ -646,9 +653,17 @@ def candidates(patch_text, repo, maps):
             else:
                 sel |= maps.all
                 notes.append(("fixture with unknown readers -> all", path))
+        elif path.startswith("sqlglot/"):
+            # package data: nothing in sqlglot reads files at run time (py.typed etc.)
+            notes.append(("package non-python file", path))
+        elif path.split("/")[0] in PACKAGING:
+            # read only by the packaging tests (setuptools runs setup.py / pyproject.toml)
+            users = set().union(*(maps.by_file.get(f, set()) for f in PACKAGING_TESTS))
+            sel |= users
+            notes.append(("packaging file", path, len(users)))
         else:
-            sel |= maps.all
-            notes.append(("other file -> all", path))
+            # docs, README, CHANGELOG, CI config, benchmarks: no test reads them
+            notes.append(("file no test reads", path))
     if sel and checkable and overrides and TPC_ENABLED:
         import split
 
@@ -661,7 +676,7 @@ def candidates(patch_text, repo, maps):
     if sel and checkable and overrides and all(
             f["new"].startswith("sqlglot/") and f["new"].endswith(".py") and f["old"] == f["new"]
             for f in files):
-        sel -= passing_here(sel, overrides, repo, maps, notes)
+        sel -= passing_here(sel, overrides, repo, maps, notes) if RUN_ENABLED else set()
     return sel, notes
 
 

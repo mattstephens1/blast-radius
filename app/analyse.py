@@ -128,6 +128,39 @@ def _parse_cached(source):
     return _PARSED[key]
 
 
+_OLD = {}
+
+
+def _old_tree(src):
+    """The unpatched file's tree, parsed once per run: every commit diffs against
+    the same pinned source. Comparing canonicalizes it in place, which is
+    idempotent, so reuse gives the same answers."""
+    key = hash(src)
+    if key not in _OLD:
+        try:
+            _OLD[key] = ast.parse(src)
+        except SyntaxError:
+            _OLD[key] = None
+    return _OLD[key]
+
+
+def stmt_ranges_in(func, changed_lines):
+    """Innermost statements of a function (old tree) containing each changed line."""
+    lo, hi = func.lineno, func.end_lineno
+    result = set()
+    stmts = [n for n in ast.walk(func) if isinstance(n, ast.stmt) and n is not func]
+    for ln in changed_lines:
+        if not (lo <= ln <= hi):
+            continue
+        best = None
+        for node in stmts:
+            if node.lineno <= ln <= node.end_lineno and (best is None or node.lineno >= best.lineno):
+                best = node
+        if best:
+            result.add((best.lineno, best.end_lineno))
+    return list(result) if result else None
+
+
 def stmt_ranges_for_lines(source, changed_lines, func_lo, func_hi):
     """Statement ranges covering the given changed lines within a function body.
 
@@ -177,9 +210,12 @@ def diff_python(old_src, new_src, old_lines=None, new_lines=None):
     old_lines / new_lines: line numbers the patch touched in each version
     (None = compare everything).
     """
+    old_t = _old_tree(old_src)
     try:
-        old_t, new_t = ast.parse(old_src), ast.parse(new_src)
+        new_t = ast.parse(new_src)
     except SyntaxError:
+        return None
+    if old_t is None:
         return None
     every = range(1, 10**7)
     old_lines = every if old_lines is None else old_lines
