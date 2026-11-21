@@ -1,0 +1,65 @@
+"""Blast Radius selector.
+
+For each patch, work out which tests could possibly notice the change, using a
+coverage map built once from the pinned sqlglot commit (see tools/build_map.py):
+
+* Python files in sqlglot/: compare the old and new syntax trees. Comment or
+  docstring-only edits change nothing, so they select nothing. Otherwise every
+  changed function selects the tests that ran any of its lines. Changes made
+  at import time (class attributes, module constants, new methods) select the
+  tests that ran any line of that class, plus, for a dialect, every test that
+  ran any of that dialect's modules.
+* Fixture files: the tests that opened that file.
+* Test files: every test in that file.
+* Anything we cannot reason about: every test (safe, never misses).
+
+The selected tests are then split across up to 8 workers, trying each worker
+count and keeping the cheapest (busiest worker + 2 s per worker).
+"""
+
+import gzip
+import json
+import math
+import os
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "app"))
+
+import candidates as C  # noqa: E402
+import split  # noqa: E402
+
+DATA = Path(os.environ.get("DATA_DIR", "/data"))
+REPO = Path(os.environ.get("SQLGLOT_DIR", "/opt/sqlglot"))
+
+
+def load_maps(tests):
+    raw = json.load(gzip.open(HERE / "maps" / "coverage.json.gz", "rt"))
+    number_by_id = {t["id"]: t["number"] for t in tests}
+    # the map stores positions in its own test list; translate to today's numbers
+    to_num = [number_by_id.get(tid) for tid in raw["test_ids"]]
+    lines = {
+        f: {ln: [to_num[i] for i in idx if to_num[i] is not None] for ln, idx in m.items()}
+        for f, m in raw["lines"].items()
+    }
+    return C.Maps(lines, raw["opened"], tests)
+
+
+def main():
+    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    maps = load_maps(tests)
+    dur_ms = {t["number"]: math.floor(t["seconds"] * 1000 + 0.5) for t in tests}
+    for patch in sorted((DATA / "commits").glob("*.patch")):
+        try:
+            selected, notes = C.candidates(patch.read_text(), REPO, maps)
+        except Exception as error:  # never crash: fall back to running everything
+            selected, notes = set(maps.all), [("error", repr(error))]
+        selected = {n for n in selected if n in dur_ms}
+        workers = split.best_split(selected, dur_ms)
+        print(json.dumps({"commit": patch.stem, "workers": workers}))
+        print(patch.stem, len(selected), notes, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
