@@ -26,6 +26,9 @@ TPC_TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpch": ("tpch", True),
     "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("tpch", False),
 }
+# narrowing import-time value changes by the changed names: small gain, not yet
+# verified against real test runs, so off
+NAME_NARROW = False
 TPC_WORTH_S = 8.0  # simulated seconds dropping them must save to pay for the check
 IMPORT_BASELINE = Path(os.environ.get(
     "IMPORT_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "import_state.json"))
@@ -330,7 +333,7 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
             # nothing built at import differs: only tests running the changed lines can notice
             notes.append(("import state unchanged", path))
             return narrow
-        if changed and not d.added:
+        if changed and not d.added and NAME_NARROW:
             # specific values built at import changed (a DuckDB SQL template the parser
             # builds, Parser.SUPPORTS_DIRECTED_JOIN): add the tests that run code naming
             # them, or whose own code names them. A changed function shows up here when
