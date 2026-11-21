@@ -201,6 +201,34 @@ def runtime_functions(repo, fixtures, suites):
 
     py.PythonExecutor.execute = execute
     tables = {s: _load_tables(fixtures, s) for s in suites}
+    # with tools/read_plugin.py available, also record which import-time values
+    # (container items, plain class attributes) rows read, so import-time changes
+    # can be checked too
+    rp = None
+    if os.environ.get("READ_PLUGIN_DIR"):
+        sys.path.insert(0, os.environ["READ_PLUGIN_DIR"])
+        import read_plugin as rp
+        rp._install(repo)
+        inner_generate = py.PythonExecutor.generate
+
+        def generate_quiet(self, expression):  # code generation is fingerprinted instead
+            saved, rp._ctx[0] = rp._ctx[0], None
+            try:
+                return inner_generate(self, expression)
+            finally:
+                rp._ctx[0] = saved
+
+        py.PythonExecutor.generate = generate_quiet
+        inner_execute = py.PythonExecutor.execute
+
+        def execute_rows(self, plan, outer_scope=None):
+            saved, rp._ctx[0] = rp._ctx[0], "rows"
+            try:
+                return inner_execute(self, plan, outer_scope)
+            finally:
+                rp._ctx[0] = saved
+
+        py.PythonExecutor.execute = execute_rows
     sys.setprofile(prof)
     try:
         full = fingerprints(fixtures, suites, tables)
@@ -208,7 +236,11 @@ def runtime_functions(repo, fixtures, suites):
         sys.setprofile(None)
     py.PythonExecutor.generate = orig_generate
     py.PythonExecutor.execute = orig_execute
-    return called, full
+    reads = None
+    if rp is not None:
+        reads = sorted({(k, rp._item_key(i)) for label, i in rp._reads.get("rows", ())
+                        for k in rp._labels[label]})
+    return called, full, reads
 
 
 def main():
@@ -224,13 +256,13 @@ def main():
         _setup(repo, None)
         empty = fingerprints(fixtures, suites)
         t0 = time.time()
-        called, full = runtime_functions(repo, fixtures, suites)
+        called, full, reads = runtime_functions(repo, fixtures, suites)
         # queries whose generated code depends on the data cannot be checked on empty tables
         data_dependent = sorted(k for k in empty if empty[k] != full.get(k))
         if data_dependent:
             raise SystemExit("generated code depends on the data for %s" % data_dependent)
         with open(path, "w") as f:
-            json.dump(sorted(called), f, indent=0)
+            json.dump({"functions": sorted(called), "reads": reads}, f, indent=0)
         print("baseline: %d queries, %d runtime functions, %d data dependent, trace %.0fs"
               % (len(empty), len(called), len(data_dependent), time.time() - t0), file=sys.stderr)
         return

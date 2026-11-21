@@ -51,9 +51,10 @@ DIFF_ITEMS = {}  # changed dict/set attribute -> its changed items, from the las
 # cannot see (dialect.py: kwargs.keys() - self.SUPPORTED_SETTINGS); they are
 # followed by name as well. Found with tools/dev/c_reads.sh.
 READ_BY_C = {"SUPPORTED_SETTINGS"}
-# On the sample and the practice board the TPC check never paid for its CPU:
-# where those tests are selected they really fail. Off unless TPC_CHECK=1.
-TPC_ENABLED = os.environ.get("TPC_CHECK") == "1"  # simulated seconds dropping them must save to pay for the check
+# On by default since it also covers import-time changes (row-phase reads): the
+# board showed test_execute_tpcds / test_max_nodes costing ~57 s while failing in
+# one commit. TPC_CHECK=0 turns it off.
+TPC_ENABLED = os.environ.get("TPC_CHECK", "1") == "1"
 IMPORT_BASELINE = Path(os.environ.get(
     "IMPORT_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "import_state.json"))
 
@@ -287,6 +288,29 @@ def _run_json(args, overrides, notes, label, timeout):
         return None
 
 
+def rows_read_nothing_changed(import_diff, row_reads, row_keys, d, maps):
+    """True when no import-time value the patch changes is read while the TPC
+    executor tests evaluate rows (traced offline, see tpc_check.py --runtime)."""
+    if row_reads is None:
+        return False
+    changed = import_diff()
+    if changed is None:
+        return False
+    reads = _reads(maps)
+    tracked = reads["keys"] if reads else {}
+    funcs = {q.rsplit(".", 1)[-1] for q, _ in d.functions}
+    for key in changed:
+        name = key.split(":", 1)[1].rsplit(".", 1)[-1]
+        if key not in row_keys:
+            if key in tracked or name in funcs:
+                continue  # traced and never read by rows / a changed function (checked by name)
+            return False  # not traced (a module constant, a class...): assume rows read it
+        items = DIFF_ITEMS.get(key)
+        if items is None or (key, "<all>") in row_reads or any((key, i) in row_reads for i in items):
+            return False
+    return True
+
+
 def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
     """The TPC executor tests in sel that provably still pass (see tpc_check.py)."""
     ids = {t["id"]: t["number"] for t in maps.tests}
@@ -298,10 +322,16 @@ def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
         return set()  # tests, fixtures or other files changed too: not covered by the check
     if cost(sel) - cost(sel - set(present)) < TPC_WORTH_S * 1000:
         return set()
+    trace = json.loads(TPC_RUNTIME.read_text())
+    if isinstance(trace, list):  # older trace: functions only, no reads
+        trace = {"functions": trace, "reads": None}
     runtime = {}
-    for entry in json.loads(TPC_RUNTIME.read_text()):
+    for entry in trace["functions"]:
         path, qual = entry.split(":", 1)
         runtime.setdefault(path, set()).add(qual.replace(".<locals>", ""))
+    method_names = {q.rsplit(".", 1)[-1] for quals in runtime.values() for q in quals}
+    row_reads = {tuple(r) for r in trace["reads"]} if trace.get("reads") is not None else None
+    row_keys = {k for k, _ in row_reads} if row_reads is not None else None
     rows_safe = True  # can the row-by-row evaluation be affected?
     for f in files:
         path = f["new"]
@@ -319,9 +349,12 @@ def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
         for q, _ in d.functions:
             if any(u == q or u.startswith(q + ".") for u in used):
                 rows_safe = False
-        if d.classes or d.added or d.module_names or d.module_other:
-            if used or import_diff() != []:
-                rows_safe = False
+        if any(q.rsplit(".", 1)[-1] in method_names for q in d.added):
+            rows_safe = False  # a new method may override one rows call
+        at_import = bool(d.classes or d.added or d.module_names or d.module_other) or any(
+            maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions)
+        if at_import and not rows_read_nothing_changed(import_diff, row_reads, row_keys, d, maps):
+            rows_safe = False
     if not rows_safe and all(rt for _, rt in present.values()):
         return set()
     fixtures = TPC_FIXTURES or str(repo / "tests" / "fixtures")
