@@ -3,10 +3,21 @@
 The rule throughout: when unsure, select more. A missed failing test costs
 300 s; running every test costs about 37 s.
 """
+import json
+import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import analyse
 import patchlib
+
+IMPORT_STATE = Path(__file__).resolve().with_name("import_state.py")
+IMPORT_BASELINE = Path(os.environ.get(
+    "IMPORT_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "import_state.json"))
+
+CHECK_WORTH_S = 3.0  # test seconds an import-state check must be able to save
 
 FAMILY_DIRS = ("dialects", "parsers", "generators", "tokenizers", "typing")
 BIG = 10**7
@@ -22,9 +33,13 @@ class Maps:
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
         self.all = {t["number"] for t in tests}
+        self.secs = {t["number"]: t["seconds"] for t in tests}
         self.repo = repo
         self.mentions = mentions or {}
         self._src = {}
+
+    def seconds(self, nums):
+        return sum(self.secs.get(n, 0) for n in nums)
 
     def covering(self, path, lo=1, hi=BIG):
         out = set()
@@ -164,7 +179,31 @@ def _borrowers(dialect, maps):
     return out
 
 
-def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None):
+def import_state_diff(repo, overrides, notes):
+    """Module globals and class attributes ("module:Class.ATTR") whose value after
+    importing sqlglot from the patched source differs from the unpatched one
+    (see import_state.py). [] means nothing differs; None means unknown, or the
+    patched package does not import at all."""
+    if not IMPORT_BASELINE.exists():
+        return None
+    env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
+    try:
+        run = subprocess.run([sys.executable, str(IMPORT_STATE), "--check", str(repo),
+                              str(IMPORT_BASELINE)], input=json.dumps(overrides),
+                             capture_output=True, text=True, env=env, timeout=10)
+        result = json.loads(run.stdout.strip().splitlines()[-1])
+    except Exception as error:
+        notes.append(("import state check failed", repr(error)[:100]))
+        return None
+    if not result.get("ok"):
+        notes.append(("patched import fails", result.get("error", "")[:100]))
+        return None
+    if result["changed"]:
+        notes.append(("import state changed", result["changed"][:5]))
+    return result["changed"]
+
+
+def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None, import_diff=None):
     d = analyse.diff_python(old, new, {lo for lo, _ in changed_ranges} if changed_ranges else None, new_lines)
     if d is None:
         notes.append(("syntax error -> all", path))
@@ -196,6 +235,34 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
             notes.append(("function runs at import", q))
         else:
             notes.append(("function", q))
+    import_time = bool(d.classes or d.added or d.module_names or d.module_other) or any(
+        maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions)
+    if import_time and import_diff is not None:
+        # the rules below must assume import-time effects reach far. Checking the
+        # patched import directly costs about a second of CPU, so only do it when
+        # it could save more than that
+        narrow = set(sel)
+        for lo, hi in changed_ranges:
+            narrow |= maps.covering(path, lo, hi)
+        own = []
+        broad = python_change(path, old, new, maps, own, changed_ranges, new_lines)
+        if maps.seconds(broad - narrow) < CHECK_WORTH_S:
+            notes.extend(own)
+            return broad
+        changed = import_diff()
+        if changed == []:
+            # nothing built at import differs: only tests running the changed lines can notice
+            notes.append(("import state unchanged", path))
+            return narrow
+        if changed and not (d.classes or d.added or d.module_names or d.module_other):
+            # a function that runs at import changed what it built there, e.g. the parser
+            # and a DuckDB SQL template: add the tests that run code naming what changed
+            names = {k.split(":", 1)[1].rsplit(".", 1)[-1] for k in changed}
+            if all(not n.startswith("__") and len(maps.files_naming(n)) <= 4 for n in names):
+                notes.append(("import-time values changed", sorted(names)))
+                return narrow | maps.referencing(names)
+        notes.extend(own)
+        return broad
     specific = {n for n in d.class_names if maps.is_specific(n, path)}
     for q, node in d.classes:
         notes.append(("class body", q))
@@ -326,7 +393,25 @@ def importers(path, maps):
 def candidates(patch_text, repo, maps):
     """Return (set of tests, notes)."""
     sel, notes = set(), []
-    for f in patchlib.parse(patch_text):
+    files = patchlib.parse(patch_text)
+    overrides, checkable = {}, True
+    for f in files:
+        if f["new"].startswith("sqlglot/") and f["new"].endswith(".py"):
+            if f["new"] == "/dev/null" or f["old"] != f["new"] and f["old"] != "/dev/null":
+                checkable = False  # deleted or renamed module: leave it to the broad rules
+                continue
+            src = repo / f["new"]
+            overrides[f["new"]] = patchlib.apply(src.read_text() if src.exists() else "", f["hunks"])
+        elif f["old"].startswith("sqlglot/"):
+            checkable = False
+    memo = []
+
+    def import_diff():
+        if not memo:
+            memo.append(import_state_diff(repo, overrides, notes) if checkable else None)
+        return memo[0]
+
+    for f in files:
         path = f["old"] if f["old"] != "/dev/null" else f["new"]
         src = repo / path
         old = src.read_text() if src.exists() else ""
@@ -334,7 +419,7 @@ def candidates(patch_text, repo, maps):
             lines = patchlib.changed_old_lines(f["hunks"])
             ranges = [(ln, ln) for ln in lines]
             sel |= python_change(path, old, patchlib.apply(old, f["hunks"]), maps, notes, ranges,
-                                 patchlib.changed_new_lines(f["hunks"]))
+                                 patchlib.changed_new_lines(f["hunks"]), import_diff)
         elif path.startswith("tests/") and path.endswith(".py"):
             sel |= test_file_change(path, old, patchlib.apply(old, f["hunks"]), maps, notes)
         elif path.startswith("tests/"):

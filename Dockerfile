@@ -9,5 +9,10 @@ RUN python /tmp/fetch_sqlglot.py && test -f /opt/sqlglot/sqlglot/parser.py
 COPY selector.py /app/selector.py
 COPY app /app/app
 COPY maps /app/maps
+# Fingerprint of sqlglot's import-time state, taken here so it matches the
+# runtime interpreter exactly (the build is not charged). See app/import_state.py.
+RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
+    python /app/app/import_state.py --baseline /opt/sqlglot /app/maps/import_state.json \
+    && test -s /app/maps/import_state.json
 ENV SQLGLOT_DIR=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]
