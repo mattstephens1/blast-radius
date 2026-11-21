@@ -16,6 +16,10 @@ import fails, the caller falls back to its broad rules.
     python import_state.py --baseline <repo> <out.json>   (image build)
     python import_state.py --check <repo> <baseline.json> (stdin: {path: source})
 """
+# sqlglot turns on extra validation when it is imported under a test runner
+# (expressions/core.py: UNITTEST = "unittest" in sys.modules or "pytest" in
+# sys.modules). Import unittest first so every check sees what the tests see.
+import unittest  # noqa: F401
 import enum
 import hashlib
 import importlib

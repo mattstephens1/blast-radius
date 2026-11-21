@@ -22,6 +22,10 @@ did before, so they pass.
     python tpc_check.py --runtime <repo> <fixtures> <out.json>    (once, offline: maps/tpc_runtime.json)
     python tpc_check.py --check <repo> <fixtures> <baseline.json>  (stdin: {path: source})
 """
+# sqlglot turns on extra validation when it is imported under a test runner
+# (expressions/core.py: UNITTEST = "unittest" in sys.modules or "pytest" in
+# sys.modules). Import unittest first so every check sees what the tests see.
+import unittest  # noqa: F401
 import hashlib
 import json
 import os

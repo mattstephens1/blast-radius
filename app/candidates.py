@@ -40,6 +40,11 @@ RUN_WORTH_S = 1.0   # ...and leaving them out could save at least this much
 # test modules that need packages the image does not have (DuckDB, pandas)
 CANNOT_RUN = ("tests/test_optimizer.py", "tests/test_executor.py")
 TPC_WORTH_S = 8.0
+MAXNODES_CHECK = Path(__file__).resolve().with_name("maxnodes_check.py")
+MAXNODES_BASELINE = Path(os.environ.get(
+    "MAXNODES_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "maxnodes.json"))
+MAXNODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
+MAXNODES_WORTH_S = 6.0  # simulated seconds leaving it out must save (the check costs ~1-2 s CPU)
 READS = Path(__file__).resolve().parent.parent / "maps" / "reads.pkl.z"
 DIFF_ITEMS = {}  # changed dict/set attribute -> its changed items, from the last import check
 # containers that sqlglot reads at run time through C fast paths the read map
@@ -765,8 +770,34 @@ def candidates(patch_text, repo, maps):
     if sel and checkable and overrides and all(
             f["new"].startswith("sqlglot/") and f["new"].endswith(".py") and f["old"] == f["new"]
             for f in files):
+        sel -= max_nodes_unaffected(sel, overrides, repo, maps, notes)
+    if sel and checkable and overrides and all(
+            f["new"].startswith("sqlglot/") and f["new"].endswith(".py") and f["old"] == f["new"]
+            for f in files):
         sel -= passing_here(sel, overrides, repo, maps, notes) if RUN_ENABLED else set()
     return sel, notes
+
+
+def max_nodes_unaffected(sel, overrides, repo, maps, notes):
+    """{test_max_nodes} when it is selected, leaving it out saves enough, and
+    app/maxnodes_check.py proves the patch leaves everything it checks unchanged."""
+    import split
+    n = next((t["number"] for t in maps.tests if t["id"] == MAXNODES_TEST), None)
+    if n is None or n not in sel or not MAXNODES_BASELINE.exists():
+        return set()
+
+    def cost(nums):
+        dur = {x: int(maps.secs[x] * 1000 + 0.5) for x in nums}
+        ws = split.best_split(nums, dur)
+        return max(sum(dur[x] for x in w) for w in ws) + split.WORKER_MS * len(ws) if ws else 0
+
+    if cost(sel) - cost(sel - {n}) < MAXNODES_WORTH_S * 1000:
+        return set()
+    result = _run_json([MAXNODES_CHECK, "--check", repo, MAXNODES_BASELINE], overrides, notes,
+                       "max_nodes check", 60)
+    same = bool(result and result.get("ok") and result.get("same"))
+    notes.append(("max_nodes unchanged" if same else "max_nodes may change",))
+    return {n} if same else set()
 
 
 def passing_here(sel, overrides, repo, maps, notes):
