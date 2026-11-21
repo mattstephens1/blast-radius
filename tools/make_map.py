@@ -102,9 +102,15 @@ for tid, i in idx.items():
             mentions[name].add(i)
 mentions = {k: sorted(v) for k, v in mentions.items()}
 
-with gzip.open(dest, "wt") as fh:
-    json.dump({"test_ids": ids, "lines": lines, "import_lines": import_lines,
+# Saved as a compressed pickle of frozensets (identical sets shared): loads in a
+# fraction of the time JSON takes, and CPU time counts towards the score.
+import pickle
+import zlib
+pool = {}
+lines = {f: {ln: pool.setdefault(frozenset(v), frozenset(v)) for ln, v in m.items()} for f, m in lines.items()}
+with open(dest, "wb") as fh:
+    fh.write(zlib.compress(pickle.dumps({"test_ids": ids, "lines": lines, "import_lines": import_lines,
                "opened": {k: sorted(v) for k, v in opened.items()},
                "unattributed": [u for u in unattributed if not u.endswith((".py", ".pyc"))],
-               "mentions": mentions}, fh, separators=(",", ":"))
+               "mentions": mentions}, protocol=5), 6))
 print(len(lines), "files;", len(opened), "fixtures;", len(unattributed), "files opened outside tests")

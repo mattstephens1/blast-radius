@@ -20,7 +20,8 @@ The selected tests are then split across up to 8 workers, trying each worker
 count and keeping the cheapest (busiest worker + 2 s per worker).
 """
 
-import gzip
+import pickle
+import zlib
 import json
 import math
 import os
@@ -38,20 +39,18 @@ REPO = Path(os.environ.get("SQLGLOT_DIR", "/opt/sqlglot"))
 
 
 def load_maps(tests):
-    raw = json.load(gzip.open(HERE / "maps" / "coverage.json.gz", "rt"))
+    raw = pickle.loads(zlib.decompress((HERE / "maps" / "coverage.pkl.z").read_bytes()))
     number_by_id = {t["id"]: t["number"] for t in tests}
-    # the map stores positions in its own test list; translate to today's numbers
     to_num = [number_by_id.get(tid) for tid in raw["test_ids"]]
-    lines = {
-        f: {ln: [to_num[i] for i in idx if to_num[i] is not None] for ln, idx in m.items()}
-        for f, m in raw["lines"].items()
-    }
-    opened = {
-        path: {number_by_id[tid] for tid in tids if tid in number_by_id}
-        for path, tids in raw["opened"].items()
-    }
-    return C.Maps(lines, raw["import_lines"], opened, raw["unattributed"], tests, REPO,
-                  raw.get("mentions"))
+    lines = raw["lines"]
+    if to_num != list(range(len(to_num))):
+        # tests.json is numbered differently from the map: translate
+        lines = {f: {ln: frozenset(to_num[i] for i in s if to_num[i] is not None) for ln, s in m.items()}
+                 for f, m in lines.items()}
+    opened = {path: {number_by_id[tid] for tid in tids if tid in number_by_id}
+              for path, tids in raw["opened"].items()}
+    mentions = {k: {to_num[i] for i in v if to_num[i] is not None} for k, v in raw["mentions"].items()}
+    return C.Maps(lines, raw["import_lines"], opened, raw["unattributed"], tests, REPO, mentions)
 
 
 def main():

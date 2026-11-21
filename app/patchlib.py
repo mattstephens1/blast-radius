@@ -64,3 +64,19 @@ def changed_old_lines(hunks):
             else:
                 lines.add(pos - 1); lines.add(pos)
     return lines
+
+
+
+def changed_new_lines(hunks):
+    """New-file line numbers that were added, plus the new lines either side of deletions."""
+    lines, shift = set(), 0
+    for start, body in hunks:
+        pos = start + shift
+        for ln in body:
+            if ln[0] == " ":
+                pos += 1
+            elif ln[0] == "+":
+                lines.add(pos); pos += 1; shift += 1
+            else:
+                lines.add(pos - 1); lines.add(pos); shift -= 1
+    return lines
