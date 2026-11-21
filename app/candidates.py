@@ -14,6 +14,8 @@ import analyse
 import patchlib
 
 IMPORT_STATE = Path(__file__).resolve().with_name("import_state.py")
+INDEX_FILE = Path(os.environ.get(
+    "INDEX_FILE", Path(__file__).resolve().parent.parent / "maps" / "index.marshal"))
 TPC_CHECK = Path(__file__).resolve().with_name("tpc_check.py")
 TPC_BASELINE = Path(os.environ.get(
     "TPC_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "tpc_state.json"))
@@ -90,16 +92,14 @@ class Maps:
         return any(lo <= ln <= hi for ln in self.import_lines.get(path, ()))
 
     def index(self):
-        """word -> [(path, line)], built once: exact case and lower case."""
+        """word -> [(path, line)], exact case and lower case: loaded from the file
+        written at image build time (write_index), else built here."""
         if not hasattr(self, "_idx"):
-            exact, lower = {}, {}
-            word = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-            for path, lines in self.source_lines().items():
-                for i, text in enumerate(lines, 1):
-                    for w in set(word.findall(text)):
-                        exact.setdefault(w, []).append((path, i))
-                        lower.setdefault(w.lower(), []).append((path, i))
-            self._idx, self._lidx = exact, lower
+            if INDEX_FILE.exists():
+                import marshal
+                self._idx, self._lidx = marshal.loads(INDEX_FILE.read_bytes())
+            else:
+                self._idx, self._lidx = build_index(self.source_lines())
         return self._idx, self._lidx
 
     def source_lines(self):
@@ -131,6 +131,24 @@ class Maps:
             for path, i in exact.get(name, ()):
                 out |= self.lines.get(path, {}).get(i, set())
         return out
+
+
+def build_index(source_lines):
+    exact, lower = {}, {}
+    word = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    for path, lines in source_lines.items():
+        for i, text in enumerate(lines, 1):
+            for w in set(word.findall(text)):
+                exact.setdefault(w, []).append((path, i))
+                lower.setdefault(w.lower(), []).append((path, i))
+    return exact, lower
+
+
+def write_index(repo, dest):
+    """Image build step: the source index, so runs load it instead of building it."""
+    import marshal
+    m = Maps({}, {}, {}, [], [], Path(repo))
+    Path(dest).write_bytes(marshal.dumps(build_index(m.source_lines())))
 
 
 def _dialect_of(path):
