@@ -34,7 +34,6 @@ sys.path.insert(0, str(HERE / "app"))
 import candidates as C  # noqa: E402
 import split  # noqa: E402
 
-DIAG_EMPTY_ABOVE_MS = 10_000
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 REPO = Path(os.environ.get("SQLGLOT_DIR", "/opt/sqlglot"))
 
@@ -65,11 +64,6 @@ def main():
             selected, notes = set(maps.all), [("error", repr(error))]
         selected = {n for n in selected if n in dur_ms}
         workers = split.best_split(selected, dur_ms)
-        # DIAGNOSTIC BUILD, not an entry: commits whose selection would cost more than
-        # DIAG_EMPTY_ABOVE_MS select nothing, so the board's score shows how much
-        # time those commits take (simulated drop) and how many really fail (misses)
-        if workers and max(sum(dur_ms[n] for n in w) for w in workers) + 2000 * len(workers) > DIAG_EMPTY_ABOVE_MS:
-            workers = []
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         print(patch.stem, len(selected), notes, file=sys.stderr)
 
