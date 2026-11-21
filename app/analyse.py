@@ -42,10 +42,33 @@ def _strip_docstrings(node):
     return node
 
 
+def _singleton(node):
+    """None, or an ALL_CAPS attribute such as TokenType.SELECT (an enum member)."""
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    return isinstance(node, ast.Attribute) and node.attr.isupper() and len(node.attr) > 1
+
+
+class _Canonical(ast.NodeTransformer):
+    """Rewrite `x is None` as `x == None` (and `is not` as `!=`), likewise for enum
+    members. In sqlglot these mean the same thing: no class that meets None or an
+    enum member there has an __eq__ that disagrees with identity."""
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and (_singleton(node.left) or _singleton(node.comparators[0])):
+            op = node.ops[0]
+            if isinstance(op, ast.Is):
+                node.ops = [ast.Eq()]
+            elif isinstance(op, ast.IsNot):
+                node.ops = [ast.NotEq()]
+        return node
+
+
 def _dump(node, cache):
     key = id(node)
     if key not in cache:
-        cache[key] = ast.dump(_strip_docstrings(node))
+        cache[key] = ast.dump(_Canonical().visit(_strip_docstrings(node)))
     return cache[key]
 
 
