@@ -14,5 +14,9 @@ COPY maps /app/maps
 RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
     python /app/app/import_state.py --baseline /opt/sqlglot /app/maps/import_state.json \
     && test -s /app/maps/import_state.json
+# Fingerprints of what the TPC executor tests prepare from each query (see app/tpc_check.py).
+RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
+    python /app/app/tpc_check.py --baseline /opt/sqlglot /opt/sqlglot/tests/fixtures /app/maps/tpc_state.json \
+    && test -s /app/maps/tpc_state.json
 ENV SQLGLOT_DIR=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]

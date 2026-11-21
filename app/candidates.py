@@ -14,6 +14,19 @@ import analyse
 import patchlib
 
 IMPORT_STATE = Path(__file__).resolve().with_name("import_state.py")
+TPC_CHECK = Path(__file__).resolve().with_name("tpc_check.py")
+TPC_BASELINE = Path(os.environ.get(
+    "TPC_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "tpc_state.json"))
+TPC_RUNTIME = Path(__file__).resolve().parent.parent / "maps" / "tpc_runtime.json"
+TPC_FIXTURES = os.environ.get("TPC_FIXTURES")  # default: <repo>/tests/fixtures
+# the TPC executor tests and the suite whose fingerprints each depends on;
+# "runtime" ones also evaluate rows with sqlglot's executor
+TPC_TESTS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("tpcds", True),
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": ("tpch", True),
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("tpch", False),
+}
+TPC_WORTH_S = 8.0  # simulated seconds dropping them must save to pay for the check
 IMPORT_BASELINE = Path(os.environ.get(
     "IMPORT_BASELINE", Path(__file__).resolve().parent.parent / "maps" / "import_state.json"))
 
@@ -33,6 +46,7 @@ class Maps:
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
         self.all = {t["number"] for t in tests}
+        self.tests = tests
         self.secs = {t["number"]: t["seconds"] for t in tests}
         self.repo = repo
         self.mentions = mentions or {}
@@ -203,6 +217,67 @@ def import_state_diff(repo, overrides, notes):
     return result["changed"]
 
 
+def _run_json(args, overrides, notes, label, timeout):
+    env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
+    try:
+        run = subprocess.run([sys.executable] + [str(a) for a in args], input=json.dumps(overrides),
+                             capture_output=True, text=True, env=env, timeout=timeout)
+        return json.loads(run.stdout.strip().splitlines()[-1])
+    except Exception as error:
+        notes.append((label + " failed", repr(error)[:100]))
+        return None
+
+
+def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
+    """The TPC executor tests in sel that provably still pass (see tpc_check.py)."""
+    ids = {t["id"]: t["number"] for t in maps.tests}
+    present = {ids[k]: v for k, v in TPC_TESTS.items() if ids.get(k) in sel}
+    if not present or not TPC_BASELINE.exists() or not TPC_RUNTIME.exists():
+        return set()
+    if any(not (f["new"].startswith("sqlglot/") and f["new"].endswith(".py")) or f["old"] != f["new"]
+           for f in files):
+        return set()  # tests, fixtures or other files changed too: not covered by the check
+    if cost(sel) - cost(sel - set(present)) < TPC_WORTH_S * 1000:
+        return set()
+    runtime = {}
+    for entry in json.loads(TPC_RUNTIME.read_text()):
+        path, qual = entry.split(":", 1)
+        runtime.setdefault(path, set()).add(qual.replace(".<locals>", ""))
+    rows_safe = True  # can the row-by-row evaluation be affected?
+    for f in files:
+        path = f["new"]
+        if path.startswith("sqlglot/executor/"):
+            rows_safe = False
+            continue
+        old = (repo / path).read_text() if (repo / path).exists() else ""
+        ranges = patchlib.changed_old_lines(f["hunks"])
+        d = analyse.diff_python(old, overrides[path], ranges, patchlib.changed_new_lines(f["hunks"]))
+        if d is None:
+            return set()
+        if d.same:
+            continue
+        used = runtime.get(path, set())
+        for q, _ in d.functions:
+            if any(u == q or u.startswith(q + ".") for u in used):
+                rows_safe = False
+        if d.classes or d.added or d.module_names or d.module_other:
+            if used or import_diff() != []:
+                rows_safe = False
+    if not rows_safe and all(rt for _, rt in present.values()):
+        return set()
+    fixtures = TPC_FIXTURES or str(repo / "tests" / "fixtures")
+    suites = sorted({suite for n, (suite, rt) in present.items() if rows_safe or not rt})
+    result = _run_json([TPC_CHECK, "--check", repo, fixtures, TPC_BASELINE, ",".join(suites)],
+                       overrides, notes, "tpc check", 30)
+    if not result or not result.get("ok"):
+        return set()
+    changed_suites = {k.split()[0] for k in result["changed"]}
+    drop = {n for n, (suite, rt) in present.items()
+            if suite in suites and suite not in changed_suites and (rows_safe or not rt)}
+    notes.append(("tpc unchanged", sorted(drop), sorted(changed_suites)))
+    return drop
+
+
 def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None, import_diff=None):
     d = analyse.diff_python(old, new, {lo for lo, _ in changed_ranges} if changed_ranges else None, new_lines)
     if d is None:
@@ -246,7 +321,8 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
             narrow |= maps.covering(path, lo, hi)
         own = []
         broad = python_change(path, old, new, maps, own, changed_ranges, new_lines)
-        if maps.seconds(broad - narrow) < CHECK_WORTH_S:
+        structural = bool(d.classes or d.added or d.module_names or d.module_other)
+        if not structural and maps.seconds(broad - narrow) < CHECK_WORTH_S:
             notes.extend(own)
             return broad
         changed = import_diff()
@@ -254,13 +330,41 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
             # nothing built at import differs: only tests running the changed lines can notice
             notes.append(("import state unchanged", path))
             return narrow
-        if changed and not (d.classes or d.added or d.module_names or d.module_other):
-            # a function that runs at import changed what it built there, e.g. the parser
-            # and a DuckDB SQL template: add the tests that run code naming what changed
-            names = {k.split(":", 1)[1].rsplit(".", 1)[-1] for k in changed}
+        if changed and not d.added:
+            # specific values built at import changed (a DuckDB SQL template the parser
+            # builds, Parser.SUPPORTS_DIRECTED_JOIN): add the tests that run code naming
+            # them, or whose own code names them. A changed function shows up here when
+            # a default or closure changed: every call runs its body, already covered.
+            funcs = {q.rsplit(".", 1)[-1]: n for q, n in d.functions}
+            names, extra = set(), set()
+            for key in changed:
+                name = key.split(":", 1)[1].rsplit(".", 1)[-1]
+                if name in funcs:
+                    extra |= maps.covering(path, *analyse.body_range(funcs[name]))
+                else:
+                    names.add(name)
             if all(not n.startswith("__") and len(maps.files_naming(n)) <= 4 for n in names):
-                notes.append(("import-time values changed", sorted(names)))
-                return narrow | maps.referencing(names)
+                by_name = narrow | extra | maps.referencing(names) | tests_naming(names, maps)
+                if maps.seconds(by_name) < maps.seconds(broad):  # both are safe: take the cheaper
+                    notes.append(("import-time values changed", sorted(names)))
+                    return by_name
+        if changed:
+            # The rules below follow the changed class or setting by name. Values derived
+            # from it elsewhere at import (Parser.FUNCTIONS is built from every
+            # _sql_names) are reached without naming it, so they need everything.
+            mod = path[:-3].replace("/", ".")
+            mod = mod[:-len(".__init__")] if mod.endswith(".__init__") else mod
+            owners = ["%s:%s" % (mod, q) for q, _ in d.classes + d.functions] \
+                + ["%s:%s" % (mod, n) for n in d.module_names]
+            fam_mods = set()
+            if fam is not None:
+                fam_mods = {"sqlglot.%s.%s" % (dd, dialect)
+                            for dialect in _subclass_dialects(_dialect_of(path), maps) for dd in FAMILY_DIRS}
+            foreign = [k for k in changed if k.split(":", 1)[0] not in fam_mods
+                       and not any(k == o or k.startswith(o + ".") for o in owners)]
+            if foreign:
+                notes.append(("import state changed elsewhere -> all", foreign[:3]))
+                return set(maps.all)
         notes.extend(own)
         return broad
     specific = {n for n in d.class_names if maps.is_specific(n, path)}
@@ -378,6 +482,39 @@ def test_file_change(path, old, new, maps, notes):
     return set(own) if only_tests else set(own) | importers(path, maps)
 
 
+def tests_naming(names, maps):
+    """Tests whose own code names one of these identifiers: the test method, or
+    every test in the file (and its importers) when a helper names it."""
+    import ast
+    word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(names))))
+    out = set()
+    for p in maps.repo.glob("tests/**/*.py"):
+        text = p.read_text()
+        if not word.search(text):
+            continue
+        rel = str(p.relative_to(maps.repo))
+        hit_lines = {i for i, line in enumerate(text.split("\n"), 1) if word.search(line)}
+        ids = {t["id"]: t["number"] for t in maps.tests if t["file"] == rel}
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            tree = None
+        covered = set()
+        for node in ast.walk(tree) if tree else ():
+            if isinstance(node, ast.ClassDef):
+                for f in node.body:
+                    if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name.startswith("test"):
+                        mine = {i for i in hit_lines if f.lineno <= i <= f.end_lineno}
+                        if mine:
+                            covered |= mine
+                            tid = "%s::%s::%s" % (rel, node.name, f.name)
+                            if tid in ids:
+                                out.add(ids[tid])
+        if hit_lines - covered:
+            out |= maps.by_file.get(rel, set()) | importers(rel, maps)
+    return out
+
+
 def importers(path, maps):
     """Tests in any test file that imports this test module."""
     module = path[:-3].replace("/", ".")
@@ -433,4 +570,13 @@ def candidates(patch_text, repo, maps):
         else:
             sel |= maps.all
             notes.append(("other file -> all", path))
+    if sel and checkable and overrides:
+        import split
+
+        def cost(nums):
+            dur = {n: int(maps.secs[n] * 1000 + 0.5) for n in nums}
+            ws = split.best_split(nums, dur)
+            return max(sum(dur[x] for x in w) for w in ws) + split.WORKER_MS * len(ws) if ws else 0
+
+        sel -= tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost)
     return sel, notes
