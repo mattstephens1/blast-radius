@@ -64,6 +64,10 @@ def main():
             selected, notes = set(maps.all), [("error", repr(error))]
         selected = {n for n in selected if n in dur_ms}
         workers = split.best_split(selected, dur_ms)
+        # DIAGNOSTIC BUILD, not an entry: commits whose selection costs 10 s or less
+        # select nothing (misses = how many of them really fail)
+        if workers and max(sum(dur_ms[n] for n in w) for w in workers) + 2000 * len(workers) <= 10_000:
+            workers = []
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         print(patch.stem, len(selected), notes, file=sys.stderr)
 
