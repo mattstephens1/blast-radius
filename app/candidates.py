@@ -32,22 +32,13 @@ TPC_TESTS = {
 # verified against real test runs, so off
 NAME_NARROW = False
 RUN_TESTS = Path(__file__).resolve().with_name("run_tests.py")
-# Run small selections here (app/run_tests.py, the shared test server with call-level
-# skipping, or the commit's worker) and leave out the tests that pass. Sound (every
-# dropped test confirmed by pytest on 400 synthetic commits), but on the practice board
-# no setting paid for its CPU: v21 -7.4 s simulated / +11.6 s CPU, v22 -4.5 / +5.3,
-# v24 -0.0 / +3.2. Off by default; RUN_TESTS=1 turns it on.
-RUN_ENABLED = os.environ.get("RUN_TESTS", "0") == "1"
-RUN_MAX_S = float(os.environ.get("RUN_MAX_S", "1.5"))  # run selections taking at most this long...
-RUN_WORTH_S = 2.0   # ...and leaving them all out would save at least this much
-RUN_TIMEOUT_S = 30  # on top of 5x the tests' recorded time
-# test files whose import or class setup costs more than a cleared commit saves
-# (test_optimizer imports pandas and DuckDB; TestExecutor loads every TPC table)
-RUN_SKIP_FILES = tuple(f for f in os.environ.get(
-    "RUN_SKIP_FILES", "tests/test_optimizer.py,tests/test_executor.py").split(",") if f)
-# without call skipping (patches that change more than function bodies) a run costs
-# the tests' full time: only tiny selections then
-RUN_MAX_FULL_S = float(os.environ.get("RUN_MAX_FULL_S", "0.3"))
+# On the practice board running tests here cost 4.4 s CPU and saved nothing:
+# there, the few selected tests almost always really fail. Off unless RUN_TESTS=1.
+RUN_ENABLED = os.environ.get("RUN_TESTS") == "1"
+RUN_MAX_S = 1.0     # run the selected tests here when they take at most this long...
+RUN_WORTH_S = 1.0   # ...and leaving them out could save at least this much
+# test modules that need packages the image does not have (DuckDB, pandas)
+CANNOT_RUN = ("tests/test_optimizer.py", "tests/test_executor.py")
 TPC_WORTH_S = 8.0
 MAXNODES_CHECK = Path(__file__).resolve().with_name("maxnodes_check.py")
 MAXNODES_BASELINE = Path(os.environ.get(
@@ -1057,163 +1048,13 @@ def max_nodes_unaffected(sel, overrides, repo, maps, notes):
     return {n} if passes else set()
 
 
-TEST_SERVER = Path(__file__).resolve().with_name("test_server.py")
-_SERVER = [None, False]  # the shared test server process, and whether it died
-
-
-def _server_call(repo, request, timeout, notes):
-    """Ask the shared test server (app/test_server.py); None if it cannot help."""
-    import select
-    if _SERVER[1]:
-        return None
-    try:
-        if _SERVER[0] is None:
-            import atexit
-            env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
-            _SERVER[0] = subprocess.Popen([sys.executable, str(TEST_SERVER), str(repo)],
-                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                          stderr=subprocess.DEVNULL, text=True, env=env)
-            atexit.register(lambda: _SERVER[0] and _SERVER[0].kill())
-        _SERVER[0].stdin.write(json.dumps(request) + "\n")
-        _SERVER[0].stdin.flush()
-        ready, _, _ = select.select([_SERVER[0].stdout], [], [], timeout)
-        line = _SERVER[0].stdout.readline() if ready else ""
-        if not line:
-            raise TimeoutError("test server: no answer in %ss" % timeout)
-        out = json.loads(line)
-        if "cannot" in out:
-            notes.append(("test server cannot", str(out["cannot"])[:80]))
-            return None
-        return out
-    except Exception as error:
-        notes.append(("test server failed", repr(error)[:100]))
-        if _SERVER[0] is not None:
-            _SERVER[0].kill()
-        _SERVER[1] = True
-        return None
-
-
-IMPORT_CALLED = Path(os.environ.get(
-    "IMPORT_CALLED", Path(__file__).resolve().parent.parent / "maps" / "import_called.json"))
-
-
-def _import_called(maps):
-    if not hasattr(maps, "_import_called"):
-        maps._import_called = set(json.loads(IMPORT_CALLED.read_text())) if IMPORT_CALLED.exists() else None
-    return maps._import_called
-
-
-def body_only_changes(overrides, repo, maps):
-    """{path: [qualnames]} when the patch changes nothing but function bodies
-    (same signatures, defaults, decorators; nothing that runs at import), so
-    swapping in the new bodies reproduces the patched program exactly; else None."""
-    import ast
-    out = {}
-    for path, new_src in overrides.items():
-        old_src = (repo / path).read_text()
-        d = analyse.diff_python(old_src, new_src)
-        if d is None:
-            return None
-        if d.same:
-            continue
-        if d.classes or d.added or d.module_names or d.module_other or not d.functions:
-            return None
-        called = _import_called(maps)
-        if called is None:
-            return None
-        new_units = analyse._units(ast.parse(new_src))
-        lines = _changed_lines(old_src, new_src)
-        for q, node in d.functions:
-            n2 = new_units.get(q)
-            if n2 is None or type(n2) is not type(node) or maps.runs_at_import(path, *analyse.body_range(node)):
-                return None
-            if "%s:%s" % (path, q) in called:
-                # it runs at import (a factory): only changes inside functions it merely
-                # defines are body-only; those closures get the new code when swapped
-                nested = [(n.lineno, n.end_lineno) for n in ast.walk(node)
-                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and n is not node]
-                own = [ln for ln in lines if node.lineno <= ln <= node.end_lineno]
-                if not own or any(not any(lo < ln <= hi for lo, hi in nested) for ln in own):
-                    return None
-            sig = lambda f: ast.dump(ast.Module(body=[], type_ignores=[])) + "|".join(
-                ast.dump(x) for x in [f.args] + f.decorator_list + ([f.returns] if f.returns else []))
-            if sig(node) != sig(n2):
-                return None
-        out[path] = [q for q, _ in d.functions]
-    return out
-
-
-CALLS = Path(__file__).resolve().parent.parent / "maps" / "calls.pkl.z"
-
-
-def _calls_by_test(maps):
-    """test id -> [(function ids, seconds)] of its Validator helper calls (maps/calls.pkl.z)."""
-    if not hasattr(maps, "_calls"):
-        maps._calls = None
-        if CALLS.exists():
-            import pickle
-            import zlib
-            m = pickle.loads(zlib.decompress(CALLS.read_bytes()))
-            by_test = {}
-            for (test, _, _, _), (fids, secs) in m["calls"].items():
-                by_test.setdefault(test, []).append((frozenset(fids), secs))
-            maps._calls = (m["names"], by_test, m["lazy"])
-    return maps._calls
-
-
-def run_estimate(sel, bodies, maps):
-    """Recorded seconds a run of sel costs when the server skips the helper calls
-    that cannot see the changed function bodies (the rest of each test runs)."""
-    m = _calls_by_test(maps)
-    ids = {t["number"]: t["id"] for t in maps.tests}
-    if m is None or not bodies:
-        return maps.seconds(sel)
-    names, by_test, lazy = m
-    changed = set()
-    for path, quals in bodies.items():
-        for q in quals:
-            p = "%s:%s" % (path, q)
-            changed |= {i for i, n in enumerate(names) if n == p or n.startswith(p + ".")}
-    if changed & lazy:
-        return maps.seconds(sel)
-    total = 0.0
-    for n in sel:
-        calls = by_test.get(ids[n])
-        if not calls:
-            total += maps.secs[n]
-            continue
-        all_s = sum(s for _, s in calls) or 1e-9
-        hit_s = sum(s for f, s in calls if f & changed)
-        total += maps.secs[n] * hit_s / all_s + 0.01  # the rest of the test body still runs
-    return total
-
-
-def _changed_lines(old_src, new_src):
-    """Old-file line numbers that a patch removes or changes."""
-    import difflib
-    out = set()
-    sm = difflib.SequenceMatcher(None, old_src.split("\n"), new_src.split("\n"), autojunk=False)
-    for tag, i1, i2, _, _ in sm.get_opcodes():
-        if tag != "equal":
-            out |= set(range(i1 + 1, max(i2, i1 + 1) + 1))
-    return out
-
-
 def passing_here(sel, overrides, repo, maps, notes):
     """The selected tests that pass when run here against the patched source,
-    when running them costs less than leaving them out saves (app/run_tests.py)."""
+    if running them is cheaper than the simulated time leaving them out saves."""
     import split
-    import run_tests
-    worker = CURRENT[0]
-    if worker is None:
-        return set()
-    ids = {t["number"]: t["id"] for t in maps.tests}
     files = {t["number"]: t["file"] for t in maps.tests}
-    if not all(run_tests.runnable(ids[n]) and files[n] not in RUN_SKIP_FILES for n in sel):
-        return set()  # the commit would still need a worker: running buys little
-    bodies = body_only_changes(overrides, repo, maps)
-    estimate = run_estimate(sel, bodies, maps) if bodies else maps.seconds(sel)
-    if estimate > (RUN_MAX_S if bodies else RUN_MAX_FULL_S):
+    runnable = {n for n in sel if files.get(n) not in CANNOT_RUN}
+    if not runnable or maps.seconds(runnable) > RUN_MAX_S:
         return set()
 
     def cost(nums):
@@ -1221,24 +1062,14 @@ def passing_here(sel, overrides, repo, maps, notes):
         ws = split.best_split(nums, dur)
         return max(sum(dur[x] for x in w) for w in ws) + split.WORKER_MS * len(ws) if ws else 0
 
-    if cost(sel) < RUN_WORTH_S * 1000:
+    if cost(sel) - cost(sel - runnable) < RUN_WORTH_S * 1000:
         return set()
-    first = sorted({path.rsplit("/", 1)[-1][:-3] for path in overrides} - {"__init__", "core", "dialect"})
-    request = {"tests": [ids[n] for n in sorted(sel)], "seconds": {ids[n]: maps.secs[n] for n in sel},
-               "first": first}
-    timeout = RUN_TIMEOUT_S + 5 * maps.seconds(sel)
-    result = None
-    if bodies:  # cheap: the shared server swaps the new bodies in, skips unaffected calls
-        result = _server_call(repo, dict(request, files={p: overrides[p] for p in bodies},
-                                         functions=bodies, skip_calls=True), timeout, notes)
-        if result is not None:
-            result["ok"] = True
-    if result is None:  # the commit's own patched worker
-        result = worker.call(dict(request, op="run_tests"), timeout, notes, "test run")
-    if not result or not result.get("ok"):
+    ids = {t["number"]: t["id"] for t in maps.tests}
+    result = _run_json([RUN_TESTS, repo], {"overrides": overrides, "tests": [ids[n] for n in sorted(runnable)]},
+                       notes, "test run", 20)
+    if not result:
         return set()
     by_id = {v: k for k, v in ids.items()}
     passed = {by_id[t] for t in result.get("passed", ()) if t in by_id}
-    notes.append(("ran here", len(sel), "passed", len(passed), "failed", len(result.get("failed", ())),
-                  "est %.2f" % estimate, "cpu %s" % result.get("cpu"), "calls %s" % result.get("calls")))
+    notes.append(("ran here", len(runnable), "passed", len(passed), "failed", len(result.get("failed", ()))))
     return passed

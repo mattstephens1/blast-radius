@@ -233,32 +233,8 @@ def snapshot(values=None):
     return out
 
 
-def import_called(repo):
-    """sqlglot functions (path:qualname, nested ones too) that run while every
-    sqlglot module is imported: factories that build TRANSFORMS entries, the
-    metaclasses... Lazily imported modules make the coverage map's own
-    import-time lines incomplete, so this is measured directly."""
-    called = set()
-    prefix = os.path.join(os.path.abspath(repo), "sqlglot") + os.sep
-
-    def prof(frame, event, arg):
-        if event == "call" and frame.f_code.co_filename.startswith(prefix):
-            called.add("%s:%s" % (os.path.relpath(frame.f_code.co_filename, os.path.abspath(repo)),
-                                  frame.f_code.co_qualname.replace(".<locals>", "")))
-    sys.setprofile(prof)
-    try:
-        import_all(repo)
-    finally:
-        sys.setprofile(None)
-    return sorted(called)
-
-
 def main():
     mode, repo, path = sys.argv[1:4]
-    if mode == "--import-called":
-        with open(path, "w") as f:
-            json.dump(import_called(repo), f)
-        return
     if mode == "--baseline":
         import_all(repo)
         values = {}

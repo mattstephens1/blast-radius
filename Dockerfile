@@ -6,11 +6,9 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 COPY tools/fetch_sqlglot.py /tmp/fetch_sqlglot.py
 RUN python /tmp/fetch_sqlglot.py && test -f /opt/sqlglot/sqlglot/parser.py
 
-# The TPC executor tests' own dependencies, at the test suite's pinned versions
-# (requirements.lock): app/tpc_check.py evaluates those tests' assertions (DuckDB's
-# answer vs sqlglot's executor, compared with pandas) for queries a patch changes.
-RUN pip install --no-cache-dir duckdb==2.0.0 pandas==3.1.1 numpy==2.5.5 \
-    python-dateutil==4.0.0 pytz==2026.6 tzdata==2026.6
+# DuckDB, the test suite's own pinned dependency: app/tpc_check.py runs it to tell
+# whether a patch that changes a TPC query's DuckDB SQL changes DuckDB's answer.
+RUN pip install --no-cache-dir duckdb==2.0.0
 
 COPY selector.py /app/selector.py
 COPY app /app/app
@@ -27,11 +25,6 @@ RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
 # test_max_nodes' assertions must hold on the unpatched source (see app/maxnodes_check.py).
 RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
     python /app/app/maxnodes_check.py --self /opt/sqlglot | grep -q '"passes": true'
-# Functions that run while sqlglot is imported (factories, metaclasses), measured
-# directly: the test server's body-swap shortcut must know them (app/test_server.py).
-RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
-    python /app/app/import_state.py --import-called /opt/sqlglot /app/maps/import_called.json \
-    && test -s /app/maps/import_called.json
 # The selector's word index over sqlglot's source, so runs load it (0.1 s) instead of
 # building it (0.26 s); CPU time counts toward the score.
 RUN cd /app/app && python -c "import candidates; candidates.write_index('/opt/sqlglot', '/app/maps/index.marshal')" \

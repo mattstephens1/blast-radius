@@ -57,12 +57,12 @@ and was checked against real test runs (see *Validation*).
    - TPC executor tests (`app/tpc_check.py`): for each TPC query, fingerprints
      everything the tests prepare (parse, pickle round trip through the tests'
      process pool, DuckDB SQL, optimized query, plan, generated Python code).
-     Where it differs, it evaluates the tests' own assertion for that query:
-     DuckDB's answer against sqlglot's executor, compared with pandas'
-     `assert_frame_equal`. Per-query traces (functions called, values read, for
-     preparation and for row evaluation) limit the work to queries the patch can
-     reach. DuckDB, pandas and numpy are installed at the test suite's pinned
-     versions.
+     Where it differs, the query is judged by its answers: DuckDB's answer for
+     the new DuckDB SQL and sqlglot's executor's result on the real data must
+     equal the unpatched ones (computed at image build). Per-query traces
+     (functions called, values read, for preparation and for row evaluation)
+     limit the work to queries the patch can reach. DuckDB is installed at the
+     test suite's pinned version.
 7. **One patched process per commit** (`app/patched_worker.py`) serves all of
    these checks, with CPU budgets, so a pathological patch cannot burn time.
 
@@ -73,20 +73,22 @@ Everything costly is precomputed: the maps are committed; baselines, the source
 word index and the list of functions run at import are built during the image
 build, which is not charged.
 
-## Running tests inside the container (off by default)
+## Tried and set aside (see git history, v20-v25)
 
-The brief allows running tests while deciding, and a commit whose few tests all
-pass needs no worker at all. `app/run_tests.py` and `app/test_server.py` do it
-soundly: process pools become threads, tests that spawn Python subprocesses are
-never trusted, a test that exceeds 5x its recorded time counts as unknown, and
-patched function bodies are swapped into one shared process (closures built at
-import included). For the Validator-based dialect tests, `tools/call_plugin.py`
-records which sqlglot functions each assertion call executes, so the shared
-process can skip assertion calls that cannot see a body-only change.
+- **Running the selected tests inside the container.** The brief allows it, and
+  a commit whose few tests all pass needs no worker. Versions v21-v24 did it
+  soundly (process pools as threads, subprocess-spawning tests never trusted,
+  per-test time limits, one shared process with patched function bodies swapped
+  in, closures built at import included, and an offline map of which sqlglot
+  functions each Validator assertion call executes, so unaffected calls could be
+  skipped). Every test they left out passed under pytest, but on the practice
+  board the scorer runs tests at roughly 1.5-2x their recorded time, and no
+  setting paid for its CPU (table below).
+- **Judging changed TPC queries by the tests' own assertion** (DuckDB vs the
+  executor with pandas' `assert_frame_equal`, v20): exact, but its extra CPU
+  outweighed what it saved on the board.
 
-All of it was validated (every test it left out passed under pytest), but on the
-practice board the scorer runs tests at roughly 1.5-2x their recorded time, and
-no setting paid for its CPU (table below). `RUN_TESTS=1` turns it on.
+The submitted code is v19's.
 
 ## Validation
 
@@ -119,12 +121,13 @@ tests, is 87.1 s).
 | v13: read map for import-time changes | 169.5 (161.5 + 8.0) |
 | v16: test-file edits select only changed tests; slow-test checks on mixed commits | 155.7 (141.5 + 14.3) |
 | v18: TPC check narrowed per query | 151.4 (141.5 + 9.9) |
-| **v19: one patched process per commit, CPU budgets** | **150.2 (141.5 + 8.7)** |
+| v19: one patched process per commit, CPU budgets | 150.2 (141.5 + 8.7) |
 | v21: in-container runner, up to 1.5 s | 154.4 (134.1 + 20.3) |
 | v22: shared test server, up to 0.6 s | 151.0 (136.9 + 14.0) |
 | v23: runner off | 150.5 (141.5 + 9.0) |
 | v24: call-level runner | 153.4 (141.4 + 11.9) |
-| v25: runner off (current) | ≈150 |
+| v25: runner off, v20's TPC assertion check kept | 152.5 |
+| **Submitted: v19's code** | **150.2** |
 
 No version since v2 missed a commit on the practice board.
 
@@ -136,6 +139,5 @@ make sample   # build, run on the sample commits, score
 
 Rebuilding the offline maps (in an image with sqlglot's test dependencies,
 `tools/dev/labeler`): `tools/coverage_plugin.py` + `tools/make_map.py`,
-`tools/read_plugin.py` + `tools/make_reads.py`, `tools/call_plugin.py` +
-`tools/make_calls.py`, and `app/tpc_check.py --runtime / --query-traces /
---rows-traces`.
+`tools/read_plugin.py` + `tools/make_reads.py`, and `app/tpc_check.py
+--runtime / --query-traces / --rows-traces`.
