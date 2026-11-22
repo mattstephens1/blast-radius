@@ -32,13 +32,13 @@ TPC_TESTS = {
 # verified against real test runs, so off
 NAME_NARROW = False
 RUN_TESTS = Path(__file__).resolve().with_name("run_tests.py")
-# On the practice board running tests here cost 4.4 s CPU and saved nothing:
-# there, the few selected tests almost always really fail. Off unless RUN_TESTS=1.
-RUN_ENABLED = os.environ.get("RUN_TESTS") == "1"
-RUN_MAX_S = 1.0     # run the selected tests here when they take at most this long...
-RUN_WORTH_S = 1.0   # ...and leaving them out could save at least this much
-# test modules that need packages the image does not have (DuckDB, pandas)
-CANNOT_RUN = ("tests/test_optimizer.py", "tests/test_executor.py")
+# Run small selections here (app/run_tests.py, in the commit's patched worker) and
+# leave out the tests that pass. A practice-board diagnostic found ~11 of ~38 cheap
+# commits fail nothing; their few tests cost ~2.5 s of workers each. RUN_TESTS=0: off.
+RUN_ENABLED = os.environ.get("RUN_TESTS", "1") == "1"
+RUN_MAX_S = 1.5     # run the selected tests here when they take at most this long in all...
+RUN_WORTH_S = 2.0   # ...and leaving them all out would save at least this much
+RUN_TIMEOUT_S = 30  # on top of 5x the tests' recorded time
 TPC_WORTH_S = 8.0
 MAXNODES_CHECK = Path(__file__).resolve().with_name("maxnodes_check.py")
 MAXNODES_BASELINE = Path(os.environ.get(
@@ -1050,26 +1050,30 @@ def max_nodes_unaffected(sel, overrides, repo, maps, notes):
 
 def passing_here(sel, overrides, repo, maps, notes):
     """The selected tests that pass when run here against the patched source,
-    if running them is cheaper than the simulated time leaving them out saves."""
+    when running them costs less than leaving them out saves (app/run_tests.py)."""
     import split
-    files = {t["number"]: t["file"] for t in maps.tests}
-    runnable = {n for n in sel if files.get(n) not in CANNOT_RUN}
-    if not runnable or maps.seconds(runnable) > RUN_MAX_S:
+    import run_tests
+    worker = CURRENT[0]
+    if worker is None:
         return set()
+    ids = {t["number"]: t["id"] for t in maps.tests}
+    if not all(run_tests.runnable(ids[n]) for n in sel) or maps.seconds(sel) > RUN_MAX_S:
+        return set()  # the commit would still need a worker: running buys little
 
     def cost(nums):
         dur = {n: int(maps.secs[n] * 1000 + 0.5) for n in nums}
         ws = split.best_split(nums, dur)
         return max(sum(dur[x] for x in w) for w in ws) + split.WORKER_MS * len(ws) if ws else 0
 
-    if cost(sel) - cost(sel - runnable) < RUN_WORTH_S * 1000:
+    if cost(sel) < RUN_WORTH_S * 1000:
         return set()
-    ids = {t["number"]: t["id"] for t in maps.tests}
-    result = _run_json([RUN_TESTS, repo], {"overrides": overrides, "tests": [ids[n] for n in sorted(runnable)]},
-                       notes, "test run", 20)
-    if not result:
+    first = sorted({path.rsplit("/", 1)[-1][:-3] for path in overrides} - {"__init__", "core", "dialect"})
+    result = worker.call({"op": "run_tests", "tests": [ids[n] for n in sorted(sel)],
+                          "seconds": {ids[n]: maps.secs[n] for n in sel}, "first": first},
+                         RUN_TIMEOUT_S + 5 * maps.seconds(sel), notes, "test run")
+    if not result or not result.get("ok"):
         return set()
     by_id = {v: k for k, v in ids.items()}
     passed = {by_id[t] for t in result.get("passed", ()) if t in by_id}
-    notes.append(("ran here", len(runnable), "passed", len(passed), "failed", len(result.get("failed", ()))))
+    notes.append(("ran here", len(sel), "passed", len(passed), "failed", len(result.get("failed", ()))))
     return passed

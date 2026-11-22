@@ -101,6 +101,13 @@ class _Recorder:
             return orig_generate(self, expression)
 
         PythonExecutor.generate = generate
+        self._restore = lambda: (setattr(ex, "Plan", orig_plan),
+                                 setattr(PythonExecutor, "generate", orig_generate))
+
+    def restore(self):
+        """Put the executor back as it was (later code, e.g. tests run in the same
+        process, must see it untouched)."""
+        self._restore()
 
 
 def fingerprints(fixtures, suites, tables=None, stop=None, only=None, duck=None, parsed=None,
@@ -116,6 +123,16 @@ def fingerprints(fixtures, suites, tables=None, stop=None, only=None, duck=None,
     from sqlglot.executor import execute
     from sqlglot.executor.table import Table
     rec = _Recorder()
+    try:
+        return _fingerprints(rec, fixtures, suites, tables, stop, only, duck, parsed, duck_sql_out)
+    finally:
+        rec.restore()
+
+
+def _fingerprints(rec, fixtures, suites, tables, stop, only, duck, parsed, duck_sql_out):
+    from sqlglot import find_tables, parse_one, transpile
+    from sqlglot.executor import execute
+    from sqlglot.executor.table import Table
     out = {}
     for suite in suites:
         queries, helpers = _queries(fixtures, suite)
