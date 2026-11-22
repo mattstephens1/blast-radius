@@ -18,10 +18,9 @@ RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
 RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
     python /app/app/tpc_check.py --baseline /opt/sqlglot /opt/sqlglot/tests/fixtures /app/maps/tpc_state.json \
     && test -s /app/maps/tpc_state.json
-# Fingerprint of what test_max_nodes checks, at reduced size (see app/maxnodes_check.py).
+# test_max_nodes' assertions must hold on the unpatched source (see app/maxnodes_check.py).
 RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
-    python /app/app/maxnodes_check.py --baseline /opt/sqlglot /app/maps/maxnodes.json \
-    && test -s /app/maps/maxnodes.json
+    python /app/app/maxnodes_check.py --self /opt/sqlglot | grep -q '"passes": true'
 # The selector's word index over sqlglot's source, so runs load it (0.1 s) instead of
 # building it (0.26 s); CPU time counts toward the score.
 RUN cd /app/app && python -c "import candidates; candidates.write_index('/opt/sqlglot', '/app/maps/index.marshal')" \

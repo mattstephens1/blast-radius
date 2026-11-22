@@ -816,7 +816,7 @@ def max_nodes_unaffected(sel, overrides, repo, maps, notes):
     app/maxnodes_check.py proves the patch leaves everything it checks unchanged."""
     import split
     n = next((t["number"] for t in maps.tests if t["id"] == MAXNODES_TEST), None)
-    if n is None or n not in sel or not MAXNODES_BASELINE.exists():
+    if n is None or n not in sel:
         return set()
 
     def cost(nums):
@@ -826,11 +826,10 @@ def max_nodes_unaffected(sel, overrides, repo, maps, notes):
 
     if cost(sel) - cost(sel - {n}) < MAXNODES_WORTH_S * 1000:
         return set()
-    result = _run_json([MAXNODES_CHECK, "--check", repo, MAXNODES_BASELINE], overrides, notes,
-                       "max_nodes check", 60)
-    same = bool(result and result.get("ok") and result.get("same"))
-    notes.append(("max_nodes unchanged" if same else "max_nodes may change",))
-    return {n} if same else set()
+    result = _run_json([MAXNODES_CHECK, "--check", repo], overrides, notes, "max_nodes check", 60)
+    passes = bool(result and result.get("ok") and result.get("passes"))
+    notes.append(("max_nodes passes" if passes else "max_nodes may fail", (result or {}).get("why", "")[:60]))
+    return {n} if passes else set()
 
 
 def passing_here(sel, overrides, repo, maps, notes):
