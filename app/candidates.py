@@ -32,12 +32,12 @@ TPC_TESTS = {
 # verified against real test runs, so off
 NAME_NARROW = False
 RUN_TESTS = Path(__file__).resolve().with_name("run_tests.py")
-# Run small selections here (app/run_tests.py, the shared test server or the commit's
-# worker) and leave out the tests that pass. Sound (161 + 232 dropped tests confirmed
-# by pytest), but on the practice board the scorer runs tests at ~1.5-2x their
-# recorded time, so it cost about what it saved (v21: -7.4 s simulated, +11.6 s CPU;
-# v22: -4.5 / +5.3). Off by default; RUN_TESTS=1 turns it on.
-RUN_ENABLED = os.environ.get("RUN_TESTS", "1") == "1"
+# Run small selections here (app/run_tests.py, the shared test server with call-level
+# skipping, or the commit's worker) and leave out the tests that pass. Sound (every
+# dropped test confirmed by pytest on 400 synthetic commits), but on the practice board
+# no setting paid for its CPU: v21 -7.4 s simulated / +11.6 s CPU, v22 -4.5 / +5.3,
+# v24 -0.0 / +3.2. Off by default; RUN_TESTS=1 turns it on.
+RUN_ENABLED = os.environ.get("RUN_TESTS", "0") == "1"
 RUN_MAX_S = float(os.environ.get("RUN_MAX_S", "1.5"))  # run selections taking at most this long...
 RUN_WORTH_S = 2.0   # ...and leaving them all out would save at least this much
 RUN_TIMEOUT_S = 30  # on top of 5x the tests' recorded time
