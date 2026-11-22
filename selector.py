@@ -63,6 +63,9 @@ def main():
         except Exception as error:  # never crash: fall back to running everything
             selected, notes = set(maps.all), [("error", repr(error))]
         selected = {n for n in selected if n in dur_ms}
+        # DIAGNOSTIC BUILD, not an entry: commits selecting (nearly) every test select nothing
+        if len(selected) >= 1500:
+            selected = set()
         workers = split.best_split(selected, dur_ms)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         print(patch.stem, len(selected), notes, file=sys.stderr)
