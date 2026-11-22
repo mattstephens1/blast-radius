@@ -621,6 +621,23 @@ def python_change(path, old, new, maps, notes, changed_ranges=(), new_lines=None
     return sel
 
 
+def changed_test_methods(d):
+    """Names of the test methods a test-module diff changes, or None when it
+    changes anything else (a helper, setUp, a class body, module code)."""
+    if d.classes or d.module_names or d.module_other:
+        return None
+    methods = set()
+    for q in [q for q, _ in d.functions] + list(d.added):
+        parts = q.split(".")
+        if len(parts) >= 2 and parts[1].startswith("test"):
+            methods.add(parts[1])
+        elif parts[0].startswith("test"):
+            methods.add(parts[0])  # a module-level test function
+        else:
+            return None
+    return methods
+
+
 def test_file_change(path, old, new, maps, notes):
     """A test module changed. Edits inside test methods affect that file only;
     anything else (helpers, base classes such as Validator in test_dialect.py)
@@ -640,11 +657,18 @@ def test_file_change(path, old, new, maps, notes):
     if d.same:
         notes.append(("no code change", path))
         return set()
-    only_tests = (not d.classes and not d.module_names and not d.module_other
-                  and all(q.rsplit(".", 1)[-1].startswith("test") for q, _ in d.functions)
-                  and all(q.rsplit(".", 1)[-1].startswith("test") for q in d.added))
-    notes.append(("test file", path, "tests only" if only_tests else "shared code"))
-    return set(own) if only_tests else set(own) | importers(path, maps)
+    # Edits inside test methods (or functions nested in them) reach only those
+    # tests: unittest runs each method on its own. A test inherited by a class
+    # elsewhere runs there too, so match the method name in importing files as well.
+    methods = changed_test_methods(d)
+    if methods is None:
+        notes.append(("test file", path, "shared code"))
+        return set(own) | importers(path, maps)
+    files = {path} | {t["file"] for t in maps.tests if t["number"] in importers(path, maps)}
+    sel = {t["number"] for t in maps.tests if t["file"] in files
+           and t["id"].rsplit("::", 1)[-1] in methods}
+    notes.append(("test file", path, "tests", sorted(methods)[:4], len(sel)))
+    return sel
 
 
 _CAMEL = re.compile(r"(?<!^)(?=[A-Z])")
@@ -791,22 +815,46 @@ def candidates(patch_text, repo, maps):
         else:
             # docs, README, CHANGELOG, CI config, benchmarks: no test reads them
             notes.append(("file no test reads", path))
-    if sel and checkable and overrides and TPC_ENABLED:
-        import split
+    import split
 
-        def cost(nums):
-            dur = {n: int(maps.secs[n] * 1000 + 0.5) for n in nums}
-            ws = split.best_split(nums, dur)
-            return max(sum(dur[x] for x in w) for w in ws) + split.WORKER_MS * len(ws) if ws else 0
+    def cost(nums):
+        dur = {n: int(maps.secs[n] * 1000 + 0.5) for n in nums}
+        ws = split.best_split(nums, dur)
+        return max(sum(dur[x] for x in w) for w in ws) + split.WORKER_MS * len(ws) if ws else 0
 
-        sel -= tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost)
-    if sel and checkable and overrides and all(
-            f["new"].startswith("sqlglot/") and f["new"].endswith(".py") and f["old"] == f["new"]
-            for f in files):
+    code = [f for f in files if f["new"].startswith("sqlglot/") and f["new"].endswith(".py")]
+    rest = [f for f in files if f not in code]
+
+    def rest_cannot_reach(test_file, test_ids):
+        """No changed file other than sqlglot source can affect these tests of
+        test_file: in that file only other test methods changed, and no test
+        module it imports nor fixture they read changed. (sqlglot source is what
+        the checks themselves evaluate.)"""
+        mine = maps.by_file.get(test_file, set())
+        for f in rest:
+            path = f["new"] if f["new"] != "/dev/null" else f["old"]
+            if path == test_file:
+                if f["old"] != f["new"]:
+                    return False
+                src = (repo / path).read_text() if (repo / path).exists() else ""
+                d = analyse.diff_python(src, patchlib.apply(src, f["hunks"]))
+                methods = changed_test_methods(d) if d is not None else None
+                if methods is None or methods & {t.rsplit("::", 1)[-1] for t in test_ids}:
+                    return False
+                continue
+            if path.startswith("tests/"):
+                if path.endswith(".py"):
+                    if importers(path, maps) & mine or path.endswith("__init__.py"):
+                        return False
+                elif path in maps.unattributed or maps.opened.get(path, set()) & mine:
+                    return False
+        return True
+
+    if sel and checkable and rest_cannot_reach("tests/test_parser.py", {MAXNODES_TEST}):
         sel -= max_nodes_unaffected(sel, overrides, repo, maps, notes)
-    if sel and checkable and overrides and all(
-            f["new"].startswith("sqlglot/") and f["new"].endswith(".py") and f["old"] == f["new"]
-            for f in files):
+    if sel and checkable and TPC_ENABLED and rest_cannot_reach("tests/test_executor.py", set(TPC_TESTS)):
+        sel -= tpc_droppable(code, sel, overrides, repo, maps, notes, import_diff, cost)
+    if sel and checkable and overrides and not rest:
         sel -= passing_here(sel, overrides, repo, maps, notes) if RUN_ENABLED else set()
     return sel, notes
 
