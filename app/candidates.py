@@ -311,6 +311,67 @@ def rows_read_nothing_changed(import_diff, row_reads, row_keys, d, maps):
     return True
 
 
+TPC_QUERIES = Path(__file__).resolve().parent.parent / "maps" / "tpc_queries.pkl.z"
+
+
+def tpc_reachable(files, overrides, repo, maps, import_diff, suites):
+    """TPC queries whose preparation can see the patch (see tpc_check.py
+    --query-traces): it calls a changed function, a lambda of a changed class
+    body, or a method named like an added one, or reads a changed import-time
+    value. None means it cannot be narrowed: recheck every query."""
+    if not TPC_QUERIES.exists():
+        return None
+    if not hasattr(maps, "_tpc_queries"):
+        import pickle
+        import zlib
+        maps._tpc_queries = {k: (set(f), set(r)) for k, (f, r) in
+                             pickle.loads(zlib.decompress(TPC_QUERIES.read_bytes())).items()}
+    traces = {k: v for k, v in maps._tpc_queries.items() if k.split()[0] in suites}
+    funcs, files_with_body_change, added = [], set(), set()
+    at_import = False
+    for f in files:
+        path = f["new"]
+        old = (repo / path).read_text() if (repo / path).exists() else ""
+        d = analyse.diff_python(old, overrides[path], patchlib.changed_old_lines(f["hunks"]),
+                                patchlib.changed_new_lines(f["hunks"]))
+        if d is None:
+            return None
+        if d.same:
+            continue
+        funcs += ["%s:%s" % (path, q) for q, _ in d.functions]
+        if d.classes or d.module_names or d.module_other:
+            files_with_body_change.add(path)
+        added |= {q.rsplit(".", 1)[-1] for q in d.added}
+        at_import = at_import or bool(d.classes or d.added or d.module_names or d.module_other) or any(
+            maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions)
+    changed_reads, any_read = set(), set()
+    if at_import:
+        changed = import_diff()
+        if changed is None:
+            return None
+        tracked = (_reads(maps) or {}).get("keys", {})
+        fnames = {x.rsplit(".", 1)[-1] for x in funcs}
+        for key in changed:
+            name = key.split(":", 1)[1].rsplit(".", 1)[-1]
+            items = DIFF_ITEMS.get(key)
+            if key not in tracked and name not in fnames:
+                return None  # an untraced value (a module constant, a class...)
+            if items is None:
+                any_read.add(key)
+            else:
+                changed_reads |= {(key, i) for i in items}
+                changed_reads.add((key, "<all>"))
+    out = set()
+    for k, (called, reads) in traces.items():
+        hit = any(c == fn or c.startswith(fn + ".") for fn in funcs for c in called)
+        hit = hit or any(c.split(":", 1)[0] in files_with_body_change and "<" in c for c in called)
+        hit = hit or any(c.rsplit(".", 1)[-1] in added for c in called)
+        hit = hit or bool(changed_reads & reads) or any(r[0] in any_read for r in reads)
+        if hit:
+            out.add(k)
+    return out
+
+
 def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
     """The TPC executor tests in sel that provably still pass (see tpc_check.py)."""
     ids = {t["id"]: t["number"] for t in maps.tests}
@@ -359,11 +420,17 @@ def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
         return set()
     fixtures = TPC_FIXTURES or str(repo / "tests" / "fixtures")
     suites = sorted({suite for n, (suite, rt) in present.items() if rows_safe or not rt})
-    result = _run_json([TPC_CHECK, "--check", repo, fixtures, TPC_BASELINE, ",".join(suites)],
-                       overrides, notes, "tpc check", 30)
-    if not result or not result.get("ok"):
-        return set()
-    changed_suites = {k.split()[0] for k in result["changed"]}
+    only = tpc_reachable(files, overrides, repo, maps, import_diff, suites)
+    if only is not None and not only:
+        changed_suites = set()  # no query's preparation can see the change
+    else:
+        request = {"overrides": overrides, "only": sorted(only)} if only is not None else overrides
+        result = _run_json([TPC_CHECK, "--check", repo, fixtures, TPC_BASELINE, ",".join(suites)],
+                           request, notes, "tpc check", 30)
+        if not result or not result.get("ok"):
+            return set()
+        changed_suites = {k.split()[0] for k in result["changed"]}
+    notes.append(("tpc queries rechecked", "all" if only is None else len(only)))
     drop = {n for n, (suite, rt) in present.items()
             if suite in suites and suite not in changed_suites and (rows_safe or not rt)}
     notes.append(("tpc unchanged", sorted(drop), sorted(changed_suites)))

@@ -101,9 +101,10 @@ class _Recorder:
         PythonExecutor.generate = generate
 
 
-def fingerprints(fixtures, suites, tables=None, stop=None):
+def fingerprints(fixtures, suites, tables=None, stop=None, only=None):
     """query key -> fingerprint. stop(key, fingerprint) -> True abandons the rest
-    of that suite (one difference is enough to know the suite changed)."""
+    of that suite (one difference is enough to know the suite changed).
+    only: the query keys to compute (default: all)."""
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.executor import execute
     from sqlglot.executor.table import Table
@@ -113,6 +114,8 @@ def fingerprints(fixtures, suites, tables=None, stop=None):
         queries, helpers = _queries(fixtures, suite)
         schema = helpers.TPCDS_SCHEMA if suite == "tpcds" else helpers.TPCH_SCHEMA
         for i, (meta, sql, expected) in enumerate(queries):
+            if only is not None and "%s %d" % (suite, i) not in only:
+                continue
             rec.log = []
             parts = []
             try:
@@ -243,6 +246,50 @@ def runtime_functions(repo, fixtures, suites):
     return called, full, reads
 
 
+def query_traces(repo, fixtures, suites):
+    """For each query, in a fresh process (so lazily built caches are built by the
+    query that needs them): the sqlglot functions its preparation calls and the
+    import-time values it reads. A query that calls no changed function and reads
+    no changed value prepares exactly what it did before."""
+    import pickle
+    sys.path.insert(0, os.environ["READ_PLUGIN_DIR"])
+    import read_plugin as rp
+    rp._install(repo)
+    keys = []
+    for suite in suites:
+        queries, _ = _queries(fixtures, suite)
+        keys += [(suite, "%s %d" % (suite, i)) for i in range(len(queries))]
+    out = {}
+    for suite, key in keys:
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            called = set()
+
+            def prof(frame, event, arg):
+                if event == "call":
+                    f = frame.f_code.co_filename
+                    if f.startswith(repo):
+                        called.add("%s:%s" % (os.path.relpath(f, repo),
+                                              frame.f_code.co_qualname.replace(".<locals>", "")))
+            rp._ctx[0] = "q"
+            sys.setprofile(prof)
+            try:
+                fingerprints(fixtures, [suite], only={key})
+            finally:
+                sys.setprofile(None)
+            reads = {(k, rp._item_key(i)) for label, i in rp._reads.get("q", ()) for k in rp._labels[label]}
+            with os.fdopen(w, "wb") as f:
+                pickle.dump((sorted(called), sorted(reads)), f)
+            os._exit(0)
+        os.close(w)
+        with os.fdopen(r, "rb") as f:
+            out[key] = pickle.load(f)
+        os.waitpid(pid, 0)
+    return out
+
+
 def main():
     mode, repo, fixtures, path = sys.argv[1:5]
     repo = os.path.abspath(repo)
@@ -266,20 +313,32 @@ def main():
         print("baseline: %d queries, %d runtime functions, %d data dependent, trace %.0fs"
               % (len(empty), len(called), len(data_dependent), time.time() - t0), file=sys.stderr)
         return
-    overrides = json.load(sys.stdin)
+    if mode == "--query-traces":  # offline, with READ_PLUGIN_DIR: maps/tpc_queries.pkl.z
+        import pickle
+        import zlib
+        traces = query_traces(repo, fixtures, suites)
+        with open(path, "wb") as f:
+            f.write(zlib.compress(pickle.dumps(traces, protocol=5), 9))
+        print("%d query traces" % len(traces), file=sys.stderr)
+        return
+    request = json.load(sys.stdin)
+    if "overrides" in request:  # {"overrides": ..., "only": [query keys]}
+        overrides, only = request["overrides"], set(request.get("only") or ())
+    else:
+        overrides, only = request, None
     with open(path) as f:
         base = json.load(f)
     try:
         _setup(repo, overrides)
         fp = base["fingerprints"]
-        now = fingerprints(fixtures, suites, stop=lambda k, v: fp.get(k) != v)
+        now = fingerprints(fixtures, suites, stop=lambda k, v: fp.get(k) != v, only=only)
     except BaseException as error:
         print(json.dumps({"ok": False, "error": repr(error)[:300]}))
         return
     # an abandoned suite counts as changed through its first differing query
     changed = sorted(k for k in now if fp.get(k) != now[k])
-    missing = sorted({k.split()[0] for k in fp if k.split()[0] in suites and k not in now}
-                     - {k.split()[0] for k in changed})
+    wanted = [k for k in fp if k.split()[0] in suites and (only is None or k in only)]
+    missing = sorted({k.split()[0] for k in wanted if k not in now} - {k.split()[0] for k in changed})
     print(json.dumps({"ok": not missing, "changed": changed, "error": "incomplete %s" % missing}))
 
 
