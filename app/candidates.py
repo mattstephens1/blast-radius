@@ -1093,6 +1093,16 @@ def _server_call(repo, request, timeout, notes):
         return None
 
 
+IMPORT_CALLED = Path(os.environ.get(
+    "IMPORT_CALLED", Path(__file__).resolve().parent.parent / "maps" / "import_called.json"))
+
+
+def _import_called(maps):
+    if not hasattr(maps, "_import_called"):
+        maps._import_called = set(json.loads(IMPORT_CALLED.read_text())) if IMPORT_CALLED.exists() else None
+    return maps._import_called
+
+
 def body_only_changes(overrides, repo, maps):
     """{path: [qualnames]} when the patch changes nothing but function bodies
     (same signatures, defaults, decorators; nothing that runs at import), so
@@ -1108,11 +1118,23 @@ def body_only_changes(overrides, repo, maps):
             continue
         if d.classes or d.added or d.module_names or d.module_other or not d.functions:
             return None
+        called = _import_called(maps)
+        if called is None:
+            return None
         new_units = analyse._units(ast.parse(new_src))
+        lines = _changed_lines(old_src, new_src)
         for q, node in d.functions:
             n2 = new_units.get(q)
             if n2 is None or type(n2) is not type(node) or maps.runs_at_import(path, *analyse.body_range(node)):
                 return None
+            if "%s:%s" % (path, q) in called:
+                # it runs at import (a factory): only changes inside functions it merely
+                # defines are body-only; those closures get the new code when swapped
+                nested = [(n.lineno, n.end_lineno) for n in ast.walk(node)
+                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and n is not node]
+                own = [ln for ln in lines if node.lineno <= ln <= node.end_lineno]
+                if not own or any(not any(lo < ln <= hi for lo, hi in nested) for ln in own):
+                    return None
             sig = lambda f: ast.dump(ast.Module(body=[], type_ignores=[])) + "|".join(
                 ast.dump(x) for x in [f.args] + f.decorator_list + ([f.returns] if f.returns else []))
             if sig(node) != sig(n2):
@@ -1164,6 +1186,17 @@ def run_estimate(sel, bodies, maps):
         hit_s = sum(s for f, s in calls if f & changed)
         total += maps.secs[n] * hit_s / all_s + 0.01  # the rest of the test body still runs
     return total
+
+
+def _changed_lines(old_src, new_src):
+    """Old-file line numbers that a patch removes or changes."""
+    import difflib
+    out = set()
+    sm = difflib.SequenceMatcher(None, old_src.split("\n"), new_src.split("\n"), autojunk=False)
+    for tag, i1, i2, _, _ in sm.get_opcodes():
+        if tag != "equal":
+            out |= set(range(i1 + 1, max(i2, i1 + 1) + 1))
+    return out
 
 
 def passing_here(sel, overrides, repo, maps, notes):

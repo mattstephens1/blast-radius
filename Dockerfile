@@ -27,6 +27,11 @@ RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
 # test_max_nodes' assertions must hold on the unpatched source (see app/maxnodes_check.py).
 RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
     python /app/app/maxnodes_check.py --self /opt/sqlglot | grep -q '"passes": true'
+# Functions that run while sqlglot is imported (factories, metaclasses), measured
+# directly: the test server's body-swap shortcut must know them (app/test_server.py).
+RUN PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
+    python /app/app/import_state.py --import-called /opt/sqlglot /app/maps/import_called.json \
+    && test -s /app/maps/import_called.json
 # The selector's word index over sqlglot's source, so runs load it (0.1 s) instead of
 # building it (0.26 s); CPU time counts toward the score.
 RUN cd /app/app && python -c "import candidates; candidates.write_index('/opt/sqlglot', '/app/maps/index.marshal')" \

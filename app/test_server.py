@@ -69,7 +69,28 @@ def swap(files, functions):
             code = new.get(f.__code__.co_qualname)
             if code is None or code.co_freevars != f.__code__.co_freevars:
                 return "cannot swap %s" % q
-            f.__code__ = code
+            why = _swap_everywhere(f.__code__, code)
+            if why:
+                return why
+    return None
+
+
+def _swap_everywhere(old, new):
+    """Point every function object built from old (or from a code object nested in
+    it) at the matching new code: closures a factory built at import time keep the
+    code they were made from."""
+    import gc
+    olds = _code_by_qualname(old, {old.co_qualname: old})
+    news = _code_by_qualname(new, {new.co_qualname: new})
+    for qual, code in olds.items():
+        users = [r for r in gc.get_referrers(code) if isinstance(r, types.FunctionType) and r.__code__ is code]
+        if not users:
+            continue
+        repl = news.get(qual)
+        if repl is None or repl.co_freevars != code.co_freevars:
+            return "cannot swap %s" % qual  # a closure whose replacement does not fit
+        for fn in users:
+            fn.__code__ = repl
     return None
 
 
