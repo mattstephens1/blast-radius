@@ -127,7 +127,7 @@ tests, is 87.1 s).
 | v23: runner off | 150.5 (141.5 + 9.0) |
 | v24: call-level runner | 153.4 (141.4 + 11.9) |
 | v25: runner off, v20's TPC assertion check kept | 152.5 |
-| **Submitted: v19's code** | **150.2** |
+| **Submitted: v19's code (resubmitted)** | **149.6** |
 
 No version since v2 missed a commit on the practice board.
 
