@@ -57,7 +57,8 @@ def main():
             elif op == "tpc":
                 import tpc_check
                 only = set(req["only"]) if req.get("only") is not None else None
-                out = tpc_check.check(req["fixtures"], req["baseline"], req["suites"], only)
+                out = tpc_check.check(req["fixtures"], req["baseline"], req["suites"], only,
+                                      req.get("execute") or ())
             else:
                 out = {"ok": False, "error": "unknown op %r" % op}
         except BaseException as error:

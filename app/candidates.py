@@ -374,19 +374,29 @@ def import_time_change(files, overrides, repo, maps):
     return False
 
 
-def tpc_reachable(files, overrides, repo, maps, import_diff, suites):
-    """TPC queries whose preparation can see the patch (see tpc_check.py
-    --query-traces): it calls a changed function, a lambda of a changed class
-    body, or a method named like an added one, or reads a changed import-time
-    value. None means it cannot be narrowed: recheck every query."""
-    if not TPC_QUERIES.exists():
-        return None
-    if not hasattr(maps, "_tpc_queries"):
+TPC_ROWS = Path(__file__).resolve().parent.parent / "maps" / "tpc_rows.pkl.z"
+
+
+def _load_traces(maps, attr, path):
+    if not hasattr(maps, attr):
         import pickle
         import zlib
-        maps._tpc_queries = {k: (set(f), set(r)) for k, (f, r) in
-                             pickle.loads(zlib.decompress(TPC_QUERIES.read_bytes())).items()}
-    traces = {k: v for k, v in maps._tpc_queries.items() if k.split()[0] in suites}
+        setattr(maps, attr, {k: (set(f), set(r)) for k, (f, r) in
+                             pickle.loads(zlib.decompress(path.read_bytes())).items()}
+                if path.exists() else None)
+    return getattr(maps, attr)
+
+
+def tpc_reachable(files, overrides, repo, maps, import_diff, suites, rows=False):
+    """TPC queries whose preparation (rows=True: row-by-row evaluation) can see the
+    patch (see tpc_check.py --query-traces / --rows-traces): it calls a changed
+    function, a lambda of a changed class body, or a method named like an added
+    one, or reads a changed import-time value. None means it cannot be narrowed."""
+    all_traces = _load_traces(maps, "_tpc_rows", TPC_ROWS) if rows else \
+        _load_traces(maps, "_tpc_queries", TPC_QUERIES)
+    if all_traces is None:
+        return None
+    traces = {k: v for k, v in all_traces.items() if k.split()[0] in suites}
     funcs, files_with_body_change, added = [], set(), set()
     at_import = False
     for f in files:
@@ -453,7 +463,8 @@ def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
     method_names = {q.rsplit(".", 1)[-1] for quals in runtime.values() for q in quals}
     row_reads = {tuple(r) for r in trace["reads"]} if trace.get("reads") is not None else None
     row_keys = {k for k, _ in row_reads} if row_reads is not None else None
-    rows_safe = True  # can the row-by-row evaluation be affected?
+    rows_safe = True     # False: the row-by-row evaluation may change and cannot be checked
+    rows_unsure = False  # True: it may change, unless the queries it touches are rerun
     for f in files:
         path = f["new"]
         if path.startswith("sqlglot/executor/"):
@@ -469,26 +480,35 @@ def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
         used = runtime.get(path, set())
         for q, _ in d.functions:
             if any(u == q or u.startswith(q + ".") for u in used):
-                rows_safe = False
+                rows_unsure = True
         if any(q.rsplit(".", 1)[-1] in method_names for q in d.added):
-            rows_safe = False  # a new method may override one rows call
+            rows_unsure = True  # a new method may override one rows call
         at_import = bool(d.classes or d.added or d.module_names or d.module_other) or any(
             maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions)
         if at_import and not rows_read_nothing_changed(import_diff, row_reads, row_keys, d, maps):
+            rows_unsure = True
+    execute_keys = []
+    if rows_safe and rows_unsure:
+        # rerun just the queries whose rows touch the change, on the real data
+        affected = tpc_reachable(files, overrides, repo, maps, import_diff, ["tpcds", "tpch"], rows=True)
+        if affected is None:
             rows_safe = False
+        else:
+            execute_keys = sorted(affected)
     if not rows_safe and all(rt for _, rt in present.values()):
         return set()
     fixtures = TPC_FIXTURES or str(repo / "tests" / "fixtures")
     suites = sorted({suite for n, (suite, rt) in present.items() if rows_safe or not rt})
     only = tpc_reachable(files, overrides, repo, maps, import_diff, suites)
-    if only is not None and not only:
+    if only is not None and not only and not execute_keys:
         changed_suites = set()  # no query's preparation can see the change
     else:
         worker = CURRENT[0]
         if worker is None:
             return set()
         result = worker.call({"op": "tpc", "fixtures": fixtures, "baseline": str(TPC_BASELINE),
-                              "suites": suites, "only": sorted(only) if only is not None else None},
+                              "suites": suites, "only": sorted(only) if only is not None else None,
+                              "execute": execute_keys},
                              15, notes, "tpc check")
         if not result or not result.get("ok"):
             return set()

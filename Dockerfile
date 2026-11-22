@@ -6,6 +6,10 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 COPY tools/fetch_sqlglot.py /tmp/fetch_sqlglot.py
 RUN python /tmp/fetch_sqlglot.py && test -f /opt/sqlglot/sqlglot/parser.py
 
+# DuckDB, the test suite's own pinned dependency: app/tpc_check.py runs it to tell
+# whether a patch that changes a TPC query's DuckDB SQL changes DuckDB's answer.
+RUN pip install --no-cache-dir duckdb==2.0.0
+
 COPY selector.py /app/selector.py
 COPY app /app/app
 COPY maps /app/maps

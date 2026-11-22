@@ -103,7 +103,8 @@ class _Recorder:
         PythonExecutor.generate = generate
 
 
-def fingerprints(fixtures, suites, tables=None, stop=None, only=None, duck=None, parsed=None):
+def fingerprints(fixtures, suites, tables=None, stop=None, only=None, duck=None, parsed=None,
+                 duck_sql_out=None):
     """query key -> fingerprint. stop(key, fingerprint) -> True abandons the rest
     of that suite (one difference is enough to know the suite changed).
     only: the query keys to compute (default: all).
@@ -132,6 +133,8 @@ def fingerprints(fixtures, suites, tables=None, stop=None, only=None, duck=None,
                 if duck is not None:
                     duck["%s %d" % (suite, i)] = hashlib.blake2b("\n".join(duck_sql).encode(),
                                                                 digest_size=12).hexdigest()
+                if duck_sql_out is not None:
+                    duck_sql_out["%s %d" % (suite, i)] = duck_sql
                 key_ = "%s %d" % (suite, i)
                 if parsed is not None:
                     parsed[key_] = "error"  # until the round trip below succeeds
@@ -158,6 +161,33 @@ def fingerprints(fixtures, suites, tables=None, stop=None, only=None, duck=None,
             out[key] = hashlib.blake2b("\n".join(parts).encode(), digest_size=12).hexdigest()
             if stop is not None and stop(key, out[key]):
                 break
+    return out
+
+
+def duck_results(fixtures, suite, sqls, conns):
+    """Hashes of what DuckDB returns (column names and rows) for each SQL, on the
+    tables the tests' setUpClass creates. None when DuckDB is not installed."""
+    try:
+        import duckdb
+    except ImportError:
+        return None
+    if suite not in conns:
+        _, helpers = _queries(fixtures, suite)
+        schema = helpers.TPCDS_SCHEMA if suite == "tpcds" else helpers.TPCH_SCHEMA
+        d = os.path.join(fixtures, "optimizer", SUITES[suite].split("/")[0]) + "/"
+        conn = duckdb.connect()
+        for table, columns in schema.items():
+            conn.execute("CREATE VIEW %s AS SELECT * FROM READ_CSV('%s%s.csv.gz', delim='|', "
+                         "header=True, columns=%s)" % (table, d, table, columns))
+        conns[suite] = conn
+    out = []
+    for sql in sqls:
+        try:
+            cur = conns[suite].execute(sql)
+            text = repr([c[0] for c in cur.description]) + "\n" + repr(cur.fetchall())
+        except Exception as error:
+            text = "error " + type(error).__name__ + " " + str(error)[:200]
+        out.append(hashlib.blake2b(text.encode(), digest_size=16).hexdigest())
     return out
 
 
@@ -342,21 +372,93 @@ def query_traces(repo, fixtures, suites):
     return out
 
 
+def rows_traces(repo, fixtures, suites):
+    """For each executed query, in a fresh process with the real data: the sqlglot
+    functions and import-time values its row-by-row evaluation uses (inside the
+    executor, outside code generation, which the fingerprints already cover). A
+    query whose rows touch nothing the patch changes evaluates them as before."""
+    import pickle
+    sys.path.insert(0, os.environ["READ_PLUGIN_DIR"])
+    import read_plugin as rp
+    rp._install(repo)
+    import sqlglot.executor.python as py
+    tables = {s: _load_tables(fixtures, s) for s in suites}
+    keys = []
+    for suite in suites:
+        queries, _ = _queries(fixtures, suite)
+        keys += [(suite, "%s %d" % (suite, i)) for i, (meta, _, _) in enumerate(queries) if meta.get("execute")]
+    out = {}
+    for suite, key in keys:
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            called, state = set(), {"rows": 0, "gen": 0}
+            orig_execute, orig_generate = py.PythonExecutor.execute, py.PythonExecutor.generate
+
+            def execute(self, plan, outer_scope=None):
+                state["rows"] += 1
+                saved, rp._ctx[0] = rp._ctx[0], ("rows" if not state["gen"] else None)
+                try:
+                    return orig_execute(self, plan, outer_scope)
+                finally:
+                    state["rows"] -= 1
+                    rp._ctx[0] = saved
+
+            def generate(self, expression):
+                state["gen"] += 1
+                saved, rp._ctx[0] = rp._ctx[0], None
+                try:
+                    return orig_generate(self, expression)
+                finally:
+                    state["gen"] -= 1
+                    rp._ctx[0] = saved
+
+            py.PythonExecutor.execute, py.PythonExecutor.generate = execute, generate
+
+            def prof(frame, event, arg):
+                if event == "call" and state["rows"] and not state["gen"]:
+                    f = frame.f_code.co_filename
+                    if f.startswith(repo):
+                        called.add("%s:%s" % (os.path.relpath(f, repo),
+                                              frame.f_code.co_qualname.replace(".<locals>", "")))
+            sys.setprofile(prof)
+            try:
+                results(fixtures, suite, [key], {(suite, n): t for n, t in tables[suite].items()})
+            finally:
+                sys.setprofile(None)
+            reads = {(k, rp._item_key(i)) for label, i in rp._reads.get("rows", ()) for k in rp._labels[label]}
+            with os.fdopen(w, "wb") as f:
+                pickle.dump((sorted(called), sorted(reads)), f)
+            os._exit(0)
+        os.close(w)
+        with os.fdopen(r, "rb") as f:
+            out[key] = pickle.load(f)
+        os.waitpid(pid, 0)
+    return out
+
+
 def main():
     mode, repo, fixtures, path = sys.argv[1:5]
     repo = os.path.abspath(repo)
     suites = sys.argv[5].split(",") if len(sys.argv) > 5 else list(SUITES)
     if mode == "--baseline":  # image build (free): also every executed query's result
         _setup(repo, None)
-        duck, parsed = {}, {}
-        fp = fingerprints(fixtures, suites, duck=duck, parsed=parsed)
+        duck, parsed, duck_sql = {}, {}, {}
+        fp = fingerprints(fixtures, suites, duck=duck, parsed=parsed, duck_sql_out=duck_sql)
+        duckres, conns = {}, {}
+        for key, sqls in duck_sql.items():
+            got = duck_results(fixtures, key.split()[0], sqls, conns)
+            if got is not None:
+                duckres[key] = got
         res, cache = {}, {}
         for suite in suites:
             queries, _ = _queries(fixtures, suite)
             keys = ["%s %d" % (suite, i) for i, (meta, _, _) in enumerate(queries) if meta.get("execute")]
             res.update(results(fixtures, suite, keys, cache))
         with open(path, "w") as f:
-            json.dump({"fingerprints": fp, "duck": duck, "parsed": parsed, "results": res}, f)
+            json.dump({"fingerprints": fp, "duck": duck, "parsed": parsed, "results": res,
+                       "duckres": duckres}, f)
         return
     if mode == "--runtime":  # minutes: run once offline, output committed to maps/
         _setup(repo, None)
@@ -371,6 +473,14 @@ def main():
             json.dump({"functions": sorted(called), "reads": reads}, f, indent=0)
         print("baseline: %d queries, %d runtime functions, %d data dependent, trace %.0fs"
               % (len(empty), len(called), len(data_dependent), time.time() - t0), file=sys.stderr)
+        return
+    if mode == "--rows-traces":  # offline, with READ_PLUGIN_DIR: maps/tpc_rows.pkl.z
+        import pickle
+        import zlib
+        traces = rows_traces(repo, fixtures, suites)
+        with open(path, "wb") as f:
+            f.write(zlib.compress(pickle.dumps(traces, protocol=5), 9))
+        print("%d rows traces" % len(traces), file=sys.stderr)
         return
     if mode == "--query-traces":  # offline, with READ_PLUGIN_DIR: maps/tpc_queries.pkl.z
         import pickle
@@ -389,15 +499,17 @@ def main():
     print(json.dumps(check(fixtures, path, suites, only)))
 
 
-def check(fixtures, path, suites, only=None):
+def check(fixtures, path, suites, only=None, execute_keys=()):
     """Compare the TPC queries' preparation (and, where it differs, their results)
     with the baseline at path, on the sqlglot already set up (_setup)."""
     with open(path) as f:
         base = json.load(f)
     try:
         fp, base_duck, base_res = base["fingerprints"], base.get("duck", {}), base.get("results", {})
-        base_parsed = base.get("parsed", {})
+        base_parsed, base_duckres = base.get("parsed", {}), base.get("duckres", {})
+        duck_sql, conns = {}, {}
         duck, parsed, cache, really, executed = {}, {}, {}, set(), [0, 0.0]
+        why, done = {}, set()
 
         started = time.process_time()
 
@@ -405,34 +517,65 @@ def check(fixtures, path, suites, only=None):
             """A differing preparation only matters if the DuckDB SQL differs or the
             executor's result on the real data does: run just this query to see."""
             if time.process_time() - started > TOTAL_BUDGET_S:
+                why[key] = "budget"
                 really.add(key)  # too slow to tell (a pathological patch): keep the tests
                 return True
             if fp.get(key) == value:
                 return False
             if base_duck.get(key) is None or duck.get(key) != base_duck.get(key):
-                really.add(key)
-                return True
-            if base_parsed.get(key) is None or parsed.get(key) != base_parsed.get(key):
-                really.add(key)  # every query is pickled to the process pool
-                return True
+                # the DuckDB SQL changed: what matters is what DuckDB returns for it
+                got = None
+                if key in base_duckres and key in duck_sql:
+                    got = duck_results(fixtures, key.split()[0], duck_sql[key], conns)
+                if got is None or got != base_duckres[key]:
+                    why[key] = "duck sql" if got is None else "duck result"
+                    really.add(key)
+                    return True
+            if parsed.get(key) == "error" or base_parsed.get(key) is None:
+                why[key] = "pickle fails"
+                really.add(key)  # every query is pickled to the process pool: a failure
+                return True      # there crashes the pool and fails the whole test
+            # a query the tests do not execute only travels to the pool and back: its
+            # parse may print differently, as long as the round trip works (checked
+            # above). Executed queries are judged by their results below.
             if key in base_res:
                 t = time.process_time()
                 same = results(fixtures, key.split()[0], [key], cache)[key] == base_res[key]
+                done.add(key)
                 executed[0] += 1
                 executed[1] += time.process_time() - t
                 if not same or executed[1] > EXECUTE_BUDGET_S:
+                    why[key] = "result" if not same else "execute budget"
                     really.add(key)
                     return True
             return False
 
-        now = fingerprints(fixtures, suites, stop=stop, only=only, duck=duck, parsed=parsed)
+        now = fingerprints(fixtures, suites, stop=stop, only=only, duck=duck, parsed=parsed,
+                           duck_sql_out=duck_sql)
+        # queries whose row evaluation may see the patch (selector's rows traces):
+        # run them on the real data even if their preparation is unchanged
+        changed_suites_ = {k.split()[0] for k in really}
+        for key in sorted(execute_keys):
+            suite = key.split()[0]
+            if suite not in suites or suite in changed_suites_ or key in done or key not in base_res:
+                continue
+            if time.process_time() - started > TOTAL_BUDGET_S:
+                why[key] = "budget"
+                really.add(key)
+                changed_suites_.add(suite)
+                continue
+            if results(fixtures, suite, [key], cache)[key] != base_res[key]:
+                why[key] = "rows result"
+                really.add(key)
+                changed_suites_.add(suite)
+            executed[0] += 1
     except BaseException as error:
         return {"ok": False, "error": repr(error)[:300]}
     # an abandoned suite counts as changed through the query that decided it
     changed = sorted(really)
     wanted = [k for k in fp if k.split()[0] in suites and (only is None or k in only)]
     missing = sorted({k.split()[0] for k in wanted if k not in now} - {k.split()[0] for k in changed})
-    return {"ok": not missing, "changed": changed, "executed": executed[0],
+    return {"ok": not missing, "changed": changed, "executed": executed[0], "why": why,
             "error": "incomplete %s" % missing}
 
 
