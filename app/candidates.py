@@ -251,6 +251,53 @@ def _borrowers(dialect, maps):
     return out
 
 
+WORKER = Path(__file__).resolve().with_name("patched_worker.py")
+
+
+class PatchedWorker:
+    """The commit's patched sqlglot, imported once in one process
+    (app/patched_worker.py), answering every check that needs it."""
+
+    def __init__(self, repo, overrides):
+        self.repo, self.overrides, self.proc, self.dead = repo, overrides, None, False
+
+    def call(self, request, timeout, notes, label):
+        if self.dead:
+            return None
+        import select
+        try:
+            if self.proc is None:
+                env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
+                self.proc = subprocess.Popen([sys.executable, str(WORKER), str(self.repo)],
+                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, text=True, env=env)
+                self.proc.stdin.write(json.dumps({"overrides": self.overrides}) + "\n")
+            self.proc.stdin.write(json.dumps(request) + "\n")
+            self.proc.stdin.flush()
+            ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+            line = self.proc.stdout.readline() if ready else ""
+            if not line:
+                raise TimeoutError("%s: no answer in %ss" % (label, timeout))
+            return json.loads(line)
+        except Exception as error:
+            notes.append((label + " failed", repr(error)[:100]))
+            self.close()
+            self.dead = True
+            return None
+
+    def close(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+            self.proc = None
+
+
+CURRENT = [None]  # the PatchedWorker of the commit being analysed
+
+
 def import_state_diff(repo, overrides, notes):
     """Module globals and class attributes ("module:Class.ATTR") whose value after
     importing sqlglot from the patched source differs from the unpatched one
@@ -258,14 +305,12 @@ def import_state_diff(repo, overrides, notes):
     patched package does not import at all."""
     if not IMPORT_BASELINE.exists():
         return None
-    env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
-    try:
-        run = subprocess.run([sys.executable, str(IMPORT_STATE), "--check", str(repo),
-                              str(IMPORT_BASELINE)], input=json.dumps(overrides),
-                             capture_output=True, text=True, env=env, timeout=10)
-        result = json.loads(run.stdout.strip().splitlines()[-1])
-    except Exception as error:
-        notes.append(("import state check failed", repr(error)[:100]))
+    worker = CURRENT[0]
+    if worker is None:
+        return None
+    result = worker.call({"op": "import_diff", "baseline": str(IMPORT_BASELINE)}, 5, notes,
+                         "import state check")
+    if result is None:
         return None
     if not result.get("ok"):
         notes.append(("patched import fails", result.get("error", "")[:100]))
@@ -312,6 +357,21 @@ def rows_read_nothing_changed(import_diff, row_reads, row_keys, d, maps):
 
 
 TPC_QUERIES = Path(__file__).resolve().parent.parent / "maps" / "tpc_queries.pkl.z"
+
+
+def import_time_change(files, overrides, repo, maps):
+    """Does any of these patched sqlglot files change something that runs at import?"""
+    for f in files:
+        path = f["new"]
+        old = (repo / path).read_text() if (repo / path).exists() else ""
+        d = analyse.diff_python(old, overrides[path], patchlib.changed_old_lines(f["hunks"]),
+                                patchlib.changed_new_lines(f["hunks"]))
+        if d is None:
+            return True
+        if d.classes or d.added or d.module_names or d.module_other or any(
+                maps.runs_at_import(path, *analyse.body_range(n)) for _, n in d.functions):
+            return True
+    return False
 
 
 def tpc_reachable(files, overrides, repo, maps, import_diff, suites):
@@ -424,9 +484,12 @@ def tpc_droppable(files, sel, overrides, repo, maps, notes, import_diff, cost):
     if only is not None and not only:
         changed_suites = set()  # no query's preparation can see the change
     else:
-        request = {"overrides": overrides, "only": sorted(only)} if only is not None else overrides
-        result = _run_json([TPC_CHECK, "--check", repo, fixtures, TPC_BASELINE, ",".join(suites)],
-                           request, notes, "tpc check", 30)
+        worker = CURRENT[0]
+        if worker is None:
+            return set()
+        result = worker.call({"op": "tpc", "fixtures": fixtures, "baseline": str(TPC_BASELINE),
+                              "suites": suites, "only": sorted(only) if only is not None else None},
+                             15, notes, "tpc check")
         if not result or not result.get("ok"):
             return set()
         changed_suites = {k.split()[0] for k in result["changed"]}
@@ -845,6 +908,16 @@ def candidates(patch_text, repo, maps):
             overrides[f["new"]] = patchlib.apply(src.read_text() if src.exists() else "", f["hunks"])
         elif f["old"].startswith("sqlglot/"):
             checkable = False
+    CURRENT[0] = PatchedWorker(repo, overrides) if checkable else None
+    try:
+        return _candidates(files, repo, maps, sel, notes, overrides, checkable)
+    finally:
+        if CURRENT[0] is not None:
+            CURRENT[0].close()
+        CURRENT[0] = None
+
+
+def _candidates(files, repo, maps, sel, notes, overrides, checkable):
     memo = []
 
     def import_diff():
@@ -917,6 +990,11 @@ def candidates(patch_text, repo, maps):
                     return False
         return True
 
+    # the import-state snapshot has to be taken before other checks run code in the
+    # shared worker: ask for it now if the TPC check may need it
+    if sel and checkable and code and any(t["id"] in TPC_TESTS and t["number"] in sel for t in maps.tests) \
+            and import_time_change(code, overrides, repo, maps):
+        import_diff()
     if sel and checkable and rest_cannot_reach("tests/test_parser.py", {MAXNODES_TEST}):
         sel -= max_nodes_unaffected(sel, overrides, repo, maps, notes)
     if sel and checkable and TPC_ENABLED and rest_cannot_reach("tests/test_executor.py", set(TPC_TESTS)):
@@ -941,7 +1019,10 @@ def max_nodes_unaffected(sel, overrides, repo, maps, notes):
 
     if cost(sel) - cost(sel - {n}) < MAXNODES_WORTH_S * 1000:
         return set()
-    result = _run_json([MAXNODES_CHECK, "--check", repo], overrides, notes, "max_nodes check", 60)
+    worker = CURRENT[0]
+    if worker is None:
+        return set()
+    result = worker.call({"op": "max_nodes"}, 15, notes, "max_nodes check")
     passes = bool(result and result.get("ok") and result.get("passes"))
     notes.append(("max_nodes passes" if passes else "max_nodes may fail", (result or {}).get("why", "")[:60]))
     return {n} if passes else set()

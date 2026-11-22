@@ -35,6 +35,7 @@ import time
 
 SUITES = {"tpcds": "tpc-ds/tpc-ds.sql", "tpch": "tpc-h/tpc-h.sql"}
 EXECUTE_BUDGET_S = 6.0  # CPU for running changed queries on real data before giving up
+TOTAL_BUDGET_S = 8.0    # CPU for the whole check before giving up (keeping the tests)
 
 
 def _queries(fixtures, suite):
@@ -384,17 +385,28 @@ def main():
         overrides, only = request["overrides"], set(request.get("only") or ())
     else:
         overrides, only = request, None
+    _setup(repo, overrides)
+    print(json.dumps(check(fixtures, path, suites, only)))
+
+
+def check(fixtures, path, suites, only=None):
+    """Compare the TPC queries' preparation (and, where it differs, their results)
+    with the baseline at path, on the sqlglot already set up (_setup)."""
     with open(path) as f:
         base = json.load(f)
     try:
-        _setup(repo, overrides)
         fp, base_duck, base_res = base["fingerprints"], base.get("duck", {}), base.get("results", {})
         base_parsed = base.get("parsed", {})
         duck, parsed, cache, really, executed = {}, {}, {}, set(), [0, 0.0]
 
+        started = time.process_time()
+
         def stop(key, value):
             """A differing preparation only matters if the DuckDB SQL differs or the
             executor's result on the real data does: run just this query to see."""
+            if time.process_time() - started > TOTAL_BUDGET_S:
+                really.add(key)  # too slow to tell (a pathological patch): keep the tests
+                return True
             if fp.get(key) == value:
                 return False
             if base_duck.get(key) is None or duck.get(key) != base_duck.get(key):
@@ -415,14 +427,13 @@ def main():
 
         now = fingerprints(fixtures, suites, stop=stop, only=only, duck=duck, parsed=parsed)
     except BaseException as error:
-        print(json.dumps({"ok": False, "error": repr(error)[:300]}))
-        return
+        return {"ok": False, "error": repr(error)[:300]}
     # an abandoned suite counts as changed through the query that decided it
     changed = sorted(really)
     wanted = [k for k in fp if k.split()[0] in suites and (only is None or k in only)]
     missing = sorted({k.split()[0] for k in wanted if k not in now} - {k.split()[0] for k in changed})
-    print(json.dumps({"ok": not missing, "changed": changed, "executed": executed[0],
-                      "error": "incomplete %s" % missing}))
+    return {"ok": not missing, "changed": changed, "executed": executed[0],
+            "error": "incomplete %s" % missing}
 
 
 if __name__ == "__main__":

@@ -245,13 +245,19 @@ def main():
             pickle.dump({k: items_of(v, canon) for k, v in values.items()}, f, protocol=5)
         return
     overrides = json.load(sys.stdin)
+    print(json.dumps(check(repo, overrides, path)))
+
+
+def check(repo, overrides, path):
+    """Import every sqlglot module (from the patched source, if overrides) and
+    compare its state with the baseline at path. overrides=None: the patched
+    finder is already installed (app/patched_worker.py)."""
     values = {}
     try:
         import_all(repo, overrides)
         now = snapshot(values)
     except BaseException as error:  # the patched package does not even import
-        print(json.dumps({"ok": False, "error": repr(error)[:300]}))
-        return
+        return {"ok": False, "error": repr(error)[:300]}
     with open(path) as f:
         base = json.load(f)
     changed = sorted(k for k in set(base) | set(now) if base.get(k) != now.get(k))
@@ -265,7 +271,7 @@ def main():
             if k in values and k in base_items:
                 a, b = base_items[k], items_of(values[k], canon)
                 items[k] = sorted(i for i in set(a) | set(b) if a.get(i) != b.get(i))
-    print(json.dumps({"ok": True, "changed": changed, "items": items}))
+    return {"ok": True, "changed": changed, "items": items}
 
 
 if __name__ == "__main__":
