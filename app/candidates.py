@@ -36,9 +36,13 @@ RUN_TESTS = Path(__file__).resolve().with_name("run_tests.py")
 # leave out the tests that pass. A practice-board diagnostic found ~11 of ~38 cheap
 # commits fail nothing; their few tests cost ~2.5 s of workers each. RUN_TESTS=0: off.
 RUN_ENABLED = os.environ.get("RUN_TESTS", "1") == "1"
-RUN_MAX_S = 1.5     # run the selected tests here when they take at most this long in all...
+RUN_MAX_S = float(os.environ.get("RUN_MAX_S", "0.6"))  # run selections taking at most this long...
 RUN_WORTH_S = 2.0   # ...and leaving them all out would save at least this much
 RUN_TIMEOUT_S = 30  # on top of 5x the tests' recorded time
+# test files whose import or class setup costs more than a cleared commit saves
+# (test_optimizer imports pandas and DuckDB; TestExecutor loads every TPC table)
+RUN_SKIP_FILES = tuple(f for f in os.environ.get(
+    "RUN_SKIP_FILES", "").split(",") if f)
 TPC_WORTH_S = 8.0
 MAXNODES_CHECK = Path(__file__).resolve().with_name("maxnodes_check.py")
 MAXNODES_BASELINE = Path(os.environ.get(
@@ -1048,6 +1052,70 @@ def max_nodes_unaffected(sel, overrides, repo, maps, notes):
     return {n} if passes else set()
 
 
+TEST_SERVER = Path(__file__).resolve().with_name("test_server.py")
+_SERVER = [None, False]  # the shared test server process, and whether it died
+
+
+def _server_call(repo, request, timeout, notes):
+    """Ask the shared test server (app/test_server.py); None if it cannot help."""
+    import select
+    if _SERVER[1]:
+        return None
+    try:
+        if _SERVER[0] is None:
+            import atexit
+            env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
+            _SERVER[0] = subprocess.Popen([sys.executable, str(TEST_SERVER), str(repo)],
+                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL, text=True, env=env)
+            atexit.register(lambda: _SERVER[0] and _SERVER[0].kill())
+        _SERVER[0].stdin.write(json.dumps(request) + "\n")
+        _SERVER[0].stdin.flush()
+        ready, _, _ = select.select([_SERVER[0].stdout], [], [], timeout)
+        line = _SERVER[0].stdout.readline() if ready else ""
+        if not line:
+            raise TimeoutError("test server: no answer in %ss" % timeout)
+        out = json.loads(line)
+        if "cannot" in out:
+            notes.append(("test server cannot", str(out["cannot"])[:80]))
+            return None
+        return out
+    except Exception as error:
+        notes.append(("test server failed", repr(error)[:100]))
+        if _SERVER[0] is not None:
+            _SERVER[0].kill()
+        _SERVER[1] = True
+        return None
+
+
+def body_only_changes(overrides, repo, maps):
+    """{path: [qualnames]} when the patch changes nothing but function bodies
+    (same signatures, defaults, decorators; nothing that runs at import), so
+    swapping in the new bodies reproduces the patched program exactly; else None."""
+    import ast
+    out = {}
+    for path, new_src in overrides.items():
+        old_src = (repo / path).read_text()
+        d = analyse.diff_python(old_src, new_src)
+        if d is None:
+            return None
+        if d.same:
+            continue
+        if d.classes or d.added or d.module_names or d.module_other or not d.functions:
+            return None
+        new_units = analyse._units(ast.parse(new_src))
+        for q, node in d.functions:
+            n2 = new_units.get(q)
+            if n2 is None or type(n2) is not type(node) or maps.runs_at_import(path, *analyse.body_range(node)):
+                return None
+            sig = lambda f: ast.dump(ast.Module(body=[], type_ignores=[])) + "|".join(
+                ast.dump(x) for x in [f.args] + f.decorator_list + ([f.returns] if f.returns else []))
+            if sig(node) != sig(n2):
+                return None
+        out[path] = [q for q, _ in d.functions]
+    return out
+
+
 def passing_here(sel, overrides, repo, maps, notes):
     """The selected tests that pass when run here against the patched source,
     when running them costs less than leaving them out saves (app/run_tests.py)."""
@@ -1057,7 +1125,9 @@ def passing_here(sel, overrides, repo, maps, notes):
     if worker is None:
         return set()
     ids = {t["number"]: t["id"] for t in maps.tests}
-    if not all(run_tests.runnable(ids[n]) for n in sel) or maps.seconds(sel) > RUN_MAX_S:
+    files = {t["number"]: t["file"] for t in maps.tests}
+    if not all(run_tests.runnable(ids[n]) and files[n] not in RUN_SKIP_FILES for n in sel) \
+            or maps.seconds(sel) > RUN_MAX_S:
         return set()  # the commit would still need a worker: running buys little
 
     def cost(nums):
@@ -1068,9 +1138,17 @@ def passing_here(sel, overrides, repo, maps, notes):
     if cost(sel) < RUN_WORTH_S * 1000:
         return set()
     first = sorted({path.rsplit("/", 1)[-1][:-3] for path in overrides} - {"__init__", "core", "dialect"})
-    result = worker.call({"op": "run_tests", "tests": [ids[n] for n in sorted(sel)],
-                          "seconds": {ids[n]: maps.secs[n] for n in sel}, "first": first},
-                         RUN_TIMEOUT_S + 5 * maps.seconds(sel), notes, "test run")
+    request = {"tests": [ids[n] for n in sorted(sel)], "seconds": {ids[n]: maps.secs[n] for n in sel},
+               "first": first}
+    timeout = RUN_TIMEOUT_S + 5 * maps.seconds(sel)
+    result, bodies = None, body_only_changes(overrides, repo, maps)
+    if bodies:  # cheap: the shared server swaps the new bodies in
+        result = _server_call(repo, dict(request, files={p: overrides[p] for p in bodies},
+                                         functions=bodies), timeout, notes)
+        if result is not None:
+            result["ok"] = True
+    if result is None:  # the commit's own patched worker
+        result = worker.call(dict(request, op="run_tests"), timeout, notes, "test run")
     if not result or not result.get("ok"):
         return set()
     by_id = {v: k for k, v in ids.items()}
