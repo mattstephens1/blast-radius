@@ -34,6 +34,7 @@ import sys
 import time
 
 SUITES = {"tpcds": "tpc-ds/tpc-ds.sql", "tpch": "tpc-h/tpc-h.sql"}
+EXECUTE_BUDGET_S = 6.0  # CPU for running changed queries on real data before giving up
 
 
 def _queries(fixtures, suite):
@@ -101,10 +102,14 @@ class _Recorder:
         PythonExecutor.generate = generate
 
 
-def fingerprints(fixtures, suites, tables=None, stop=None, only=None):
+def fingerprints(fixtures, suites, tables=None, stop=None, only=None, duck=None, parsed=None):
     """query key -> fingerprint. stop(key, fingerprint) -> True abandons the rest
     of that suite (one difference is enough to know the suite changed).
-    only: the query keys to compute (default: all)."""
+    only: the query keys to compute (default: all).
+    duck, if given, is filled with query key -> hash of its DuckDB SQL (what the
+    DuckDB side of the tests runs); parsed with query key -> hash of the parsed
+    query and its pickle round trip (what every query goes through on its way to
+    the tests' process pool, executed or not)."""
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.executor import execute
     from sqlglot.executor.table import Table
@@ -120,9 +125,19 @@ def fingerprints(fixtures, suites, tables=None, stop=None, only=None):
             parts = []
             try:
                 e = parse_one(sql)
-                parts += [repr(e), repr(pickle.loads(pickle.dumps(e))), transpile(sql, write="duckdb")[0]]
+                duck_sql = [transpile(sql, write="duckdb")[0]]
                 if suite == "tpch":  # test_optimized_tpch runs the fixture's optimized SQL too
-                    parts.append(transpile(expected, write="duckdb")[0])
+                    duck_sql.append(transpile(expected, write="duckdb")[0])
+                if duck is not None:
+                    duck["%s %d" % (suite, i)] = hashlib.blake2b("\n".join(duck_sql).encode(),
+                                                                digest_size=12).hexdigest()
+                key_ = "%s %d" % (suite, i)
+                if parsed is not None:
+                    parsed[key_] = "error"  # until the round trip below succeeds
+                trip = [repr(e), repr(pickle.loads(pickle.dumps(e)))]
+                if parsed is not None:
+                    parsed[key_] = hashlib.blake2b("\n".join(trip).encode(), digest_size=12).hexdigest()
+                parts += trip + duck_sql
                 if meta.get("execute"):
                     names = [t.name for t in find_tables(e)]
                     parts.append(repr(names))
@@ -132,6 +147,8 @@ def fingerprints(fixtures, suites, tables=None, stop=None, only=None):
                     parts.append(repr(result.columns))
             except Exception as error:
                 parts.append("error " + type(error).__name__ + " " + str(error)[:200])
+                if duck is not None:
+                    duck.setdefault("%s %d" % (suite, i), "error")
             parts += sorted(rec.log)  # independent steps run in id() order
             if os.environ.get("TPC_DUMP"):
                 with open(os.environ["TPC_DUMP"] + ("full" if tables else "empty"), "a") as f:
@@ -143,7 +160,39 @@ def fingerprints(fixtures, suites, tables=None, stop=None, only=None):
     return out
 
 
-def _load_tables(fixtures, suite):
+def results(fixtures, suite, keys, cache):
+    """query key -> hash of what sqlglot's executor returns for it on the real
+    data (columns and rows: the executor side of the tests' comparison).
+
+    The tests run each query in a process pool: the tables go to the workers
+    pickled (initializer args), the parsed query goes pickled, and the result
+    table comes back pickled. All three round trips are reproduced here."""
+    from sqlglot import find_tables, parse_one
+    from sqlglot.executor import execute
+    queries, helpers = _queries(fixtures, suite)
+    schema = helpers.TPCDS_SCHEMA if suite == "tpcds" else helpers.TPCH_SCHEMA
+    out = {}
+    for key in keys:
+        i = int(key.split()[1])
+        meta, sql, _ = queries[i]
+        try:
+            e = parse_one(sql)
+            names = [t.name for t in find_tables(e)]
+            for n in names:
+                if (suite, n) not in cache:
+                    loaded = _load_tables(fixtures, suite, [n])[n]
+                    cache[(suite, n)] = pickle.loads(pickle.dumps(loaded))  # to the worker
+            table = execute(pickle.loads(pickle.dumps(e)), schema=pickle.loads(pickle.dumps(schema)),
+                            tables={n: cache[(suite, n)] for n in names})
+            table = pickle.loads(pickle.dumps(table))  # back from the worker
+            text = repr(table.columns) + "\n" + repr(table.rows)
+        except Exception as error:
+            text = "error " + type(error).__name__ + " " + str(error)[:200]
+        out[key] = hashlib.blake2b(text.encode(), digest_size=16).hexdigest()
+    return out
+
+
+def _load_tables(fixtures, suite, names=None):
     """The test's own table loading (setUpClass), for the build-time trace."""
     import ast
     import csv
@@ -154,6 +203,8 @@ def _load_tables(fixtures, suite):
     d = os.path.join(fixtures, "optimizer", SUITES[suite].split("/")[0])
     tables = {}
     for table, columns in schema.items():
+        if names is not None and table not in names:
+            continue
         reader = csv.reader(gzip.open(os.path.join(d, table + ".csv.gz"), "rt", newline=""), delimiter="|")
         next(reader)
         rows, ctypes = [], []
@@ -294,10 +345,17 @@ def main():
     mode, repo, fixtures, path = sys.argv[1:5]
     repo = os.path.abspath(repo)
     suites = sys.argv[5].split(",") if len(sys.argv) > 5 else list(SUITES)
-    if mode == "--baseline":  # cheap: run at image build
+    if mode == "--baseline":  # image build (free): also every executed query's result
         _setup(repo, None)
+        duck, parsed = {}, {}
+        fp = fingerprints(fixtures, suites, duck=duck, parsed=parsed)
+        res, cache = {}, {}
+        for suite in suites:
+            queries, _ = _queries(fixtures, suite)
+            keys = ["%s %d" % (suite, i) for i, (meta, _, _) in enumerate(queries) if meta.get("execute")]
+            res.update(results(fixtures, suite, keys, cache))
         with open(path, "w") as f:
-            json.dump({"fingerprints": fingerprints(fixtures, suites)}, f)
+            json.dump({"fingerprints": fp, "duck": duck, "parsed": parsed, "results": res}, f)
         return
     if mode == "--runtime":  # minutes: run once offline, output committed to maps/
         _setup(repo, None)
@@ -330,16 +388,41 @@ def main():
         base = json.load(f)
     try:
         _setup(repo, overrides)
-        fp = base["fingerprints"]
-        now = fingerprints(fixtures, suites, stop=lambda k, v: fp.get(k) != v, only=only)
+        fp, base_duck, base_res = base["fingerprints"], base.get("duck", {}), base.get("results", {})
+        base_parsed = base.get("parsed", {})
+        duck, parsed, cache, really, executed = {}, {}, {}, set(), [0, 0.0]
+
+        def stop(key, value):
+            """A differing preparation only matters if the DuckDB SQL differs or the
+            executor's result on the real data does: run just this query to see."""
+            if fp.get(key) == value:
+                return False
+            if base_duck.get(key) is None or duck.get(key) != base_duck.get(key):
+                really.add(key)
+                return True
+            if base_parsed.get(key) is None or parsed.get(key) != base_parsed.get(key):
+                really.add(key)  # every query is pickled to the process pool
+                return True
+            if key in base_res:
+                t = time.process_time()
+                same = results(fixtures, key.split()[0], [key], cache)[key] == base_res[key]
+                executed[0] += 1
+                executed[1] += time.process_time() - t
+                if not same or executed[1] > EXECUTE_BUDGET_S:
+                    really.add(key)
+                    return True
+            return False
+
+        now = fingerprints(fixtures, suites, stop=stop, only=only, duck=duck, parsed=parsed)
     except BaseException as error:
         print(json.dumps({"ok": False, "error": repr(error)[:300]}))
         return
-    # an abandoned suite counts as changed through its first differing query
-    changed = sorted(k for k in now if fp.get(k) != now[k])
+    # an abandoned suite counts as changed through the query that decided it
+    changed = sorted(really)
     wanted = [k for k in fp if k.split()[0] in suites and (only is None or k in only)]
     missing = sorted({k.split()[0] for k in wanted if k not in now} - {k.split()[0] for k in changed})
-    print(json.dumps({"ok": not missing, "changed": changed, "error": "incomplete %s" % missing}))
+    print(json.dumps({"ok": not missing, "changed": changed, "executed": executed[0],
+                      "error": "incomplete %s" % missing}))
 
 
 if __name__ == "__main__":
