@@ -63,11 +63,6 @@ def main():
         except Exception as error:  # never crash: fall back to running everything
             selected, notes = set(maps.all), [("error", repr(error))]
         selected = {n for n in selected if n in dur_ms}
-        # DIAGNOSTIC BUILD, not an entry: never select the two slowest tests
-        ids = {t["number"]: t["id"] for t in tests}
-        selected = {n for n in selected if ids.get(n) not in (
-            "tests/test_parser.py::TestParser::test_max_nodes",
-            "tests/test_executor.py::TestExecutor::test_execute_tpcds")}
         workers = split.best_split(selected, dur_ms)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         print(patch.stem, len(selected), notes, file=sys.stderr)
