@@ -73,6 +73,81 @@ def swap(files, functions):
     return None
 
 
+HELPERS = ("validate_identity", "validate_all", "validate_transpile")
+CALLS = os.path.join(os.path.dirname(HERE), "maps", "calls.pkl.z")
+STATS = {"skipped": 0, "ran": 0, "unknown": 0}
+
+
+def _bare_sites(repo, rel, cache):
+    """Line ranges of statements that call a Validator helper and drop the result."""
+    if rel not in cache:
+        import ast
+        ranges = []
+        try:
+            tree = ast.parse(open(os.path.join(repo, rel)).read())
+        except (OSError, SyntaxError):
+            tree = None
+        for node in ast.walk(tree) if tree else ():
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                f = node.value.func
+                if isinstance(f, ast.Attribute) and f.attr in HELPERS and isinstance(f.value, ast.Name) \
+                        and f.value.id == "self":
+                    ranges.append((node.lineno, node.end_lineno))
+        cache[rel] = ranges
+    return cache[rel]
+
+
+def skip_unaffected_calls(repo, calls_map, functions):
+    """Wrap the Validator helpers so a call that, in the offline call map, executed
+    none of the changed functions returns at once. Only for bare-statement calls
+    (their result is dropped), known to the map, outside a helper. Returns how many
+    calls it may skip, or None if skipping is not safe for this patch."""
+    import run_tests
+    names = calls_map["names"]
+    changed = set()
+    for path, quals in functions.items():
+        for q in quals:
+            p = "%s:%s" % (path, q)
+            changed |= {i for i, n in enumerate(names) if n == p or n.startswith(p + ".")}
+    if changed & calls_map["lazy"]:
+        return None
+    from tests.dialects.test_dialect import Validator
+    calls, sites, depth = calls_map["calls"], {}, [0]
+    import hashlib
+
+    for name in HELPERS:
+        orig = getattr(Validator, name)
+
+        def wrapper(self, *args, _orig=orig, **kwargs):
+            test = run_tests.CURRENT["test"]
+            if depth[0] or test is None:
+                depth[0] += 1
+                try:
+                    return _orig(self, *args, **kwargs)
+                finally:
+                    depth[0] -= 1
+            frame = sys._getframe(1)
+            rel = os.path.relpath(frame.f_code.co_filename, repo)
+            site = "%s:%d" % (rel, frame.f_lineno)
+            h = hashlib.blake2b(repr((args, sorted(kwargs.items()))).encode(), digest_size=10).hexdigest()
+            counts = run_tests.CURRENT["counts"]
+            n = counts.get((site, h), 0)
+            counts[(site, h)] = n + 1
+            entry = calls.get((test, site, h, n))
+            bare = any(lo <= frame.f_lineno <= hi for lo, hi in _bare_sites(repo, rel, sites))
+            if entry is not None and bare and not changed.intersection(entry[0]):
+                STATS["skipped"] += 1
+                return None  # this call cannot see the patch: it passes as before
+            STATS["ran" if entry is not None else "unknown"] += 1
+            depth[0] += 1
+            try:
+                return _orig(self, *args, **kwargs)
+            finally:
+                depth[0] -= 1
+        setattr(Validator, name, wrapper)
+    return True
+
+
 def main():
     repo = os.path.abspath(sys.argv[1])
     sys.path.insert(0, repo)
@@ -82,6 +157,12 @@ def main():
     import run_tests
     import_state.import_all(repo)
     run_tests._threads_for_pools()
+    calls_map = None
+    if os.path.exists(CALLS):
+        import zlib
+        with open(CALLS, "rb") as f:
+            calls_map = pickle.loads(zlib.decompress(f.read()))
+            calls_map["calls"] = {k: (frozenset(v[0]), v[1]) for k, v in calls_map["calls"].items()}
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -97,8 +178,11 @@ def main():
             os.close(r)
             try:
                 why = swap(req["files"], req["functions"])
+                if not why and calls_map is not None and req.get("skip_calls"):
+                    skip_unaffected_calls(repo, calls_map, req["functions"])
                 out = {"cannot": why} if why else run_tests.run_here(
                     req["tests"], req.get("seconds") or {}, req.get("first") or ())
+                out["calls"] = dict(STATS)
             except BaseException as error:
                 out = {"cannot": repr(error)[:200]}
             with os.fdopen(w, "w") as f:
@@ -107,7 +191,13 @@ def main():
         os.close(w)
         with os.fdopen(r) as f:
             text = f.read()
-        os.waitpid(pid, 0)
+        _, _, usage = os.wait4(pid, 0)
+        try:
+            answer = json.loads(text)
+            answer["cpu"] = round(usage.ru_utime + usage.ru_stime, 3)
+            text = json.dumps(answer)
+        except ValueError:
+            pass
         sys.stdout.write((text or json.dumps({"cannot": "child died"})) + "\n")
         sys.stdout.flush()
 

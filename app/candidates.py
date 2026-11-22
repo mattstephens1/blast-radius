@@ -37,14 +37,17 @@ RUN_TESTS = Path(__file__).resolve().with_name("run_tests.py")
 # by pytest), but on the practice board the scorer runs tests at ~1.5-2x their
 # recorded time, so it cost about what it saved (v21: -7.4 s simulated, +11.6 s CPU;
 # v22: -4.5 / +5.3). Off by default; RUN_TESTS=1 turns it on.
-RUN_ENABLED = os.environ.get("RUN_TESTS", "0") == "1"
-RUN_MAX_S = float(os.environ.get("RUN_MAX_S", "0.6"))  # run selections taking at most this long...
+RUN_ENABLED = os.environ.get("RUN_TESTS", "1") == "1"
+RUN_MAX_S = float(os.environ.get("RUN_MAX_S", "1.5"))  # run selections taking at most this long...
 RUN_WORTH_S = 2.0   # ...and leaving them all out would save at least this much
 RUN_TIMEOUT_S = 30  # on top of 5x the tests' recorded time
 # test files whose import or class setup costs more than a cleared commit saves
 # (test_optimizer imports pandas and DuckDB; TestExecutor loads every TPC table)
 RUN_SKIP_FILES = tuple(f for f in os.environ.get(
-    "RUN_SKIP_FILES", "").split(",") if f)
+    "RUN_SKIP_FILES", "tests/test_optimizer.py,tests/test_executor.py").split(",") if f)
+# without call skipping (patches that change more than function bodies) a run costs
+# the tests' full time: only tiny selections then
+RUN_MAX_FULL_S = float(os.environ.get("RUN_MAX_FULL_S", "0.3"))
 TPC_WORTH_S = 8.0
 MAXNODES_CHECK = Path(__file__).resolve().with_name("maxnodes_check.py")
 MAXNODES_BASELINE = Path(os.environ.get(
@@ -1118,6 +1121,51 @@ def body_only_changes(overrides, repo, maps):
     return out
 
 
+CALLS = Path(__file__).resolve().parent.parent / "maps" / "calls.pkl.z"
+
+
+def _calls_by_test(maps):
+    """test id -> [(function ids, seconds)] of its Validator helper calls (maps/calls.pkl.z)."""
+    if not hasattr(maps, "_calls"):
+        maps._calls = None
+        if CALLS.exists():
+            import pickle
+            import zlib
+            m = pickle.loads(zlib.decompress(CALLS.read_bytes()))
+            by_test = {}
+            for (test, _, _, _), (fids, secs) in m["calls"].items():
+                by_test.setdefault(test, []).append((frozenset(fids), secs))
+            maps._calls = (m["names"], by_test, m["lazy"])
+    return maps._calls
+
+
+def run_estimate(sel, bodies, maps):
+    """Recorded seconds a run of sel costs when the server skips the helper calls
+    that cannot see the changed function bodies (the rest of each test runs)."""
+    m = _calls_by_test(maps)
+    ids = {t["number"]: t["id"] for t in maps.tests}
+    if m is None or not bodies:
+        return maps.seconds(sel)
+    names, by_test, lazy = m
+    changed = set()
+    for path, quals in bodies.items():
+        for q in quals:
+            p = "%s:%s" % (path, q)
+            changed |= {i for i, n in enumerate(names) if n == p or n.startswith(p + ".")}
+    if changed & lazy:
+        return maps.seconds(sel)
+    total = 0.0
+    for n in sel:
+        calls = by_test.get(ids[n])
+        if not calls:
+            total += maps.secs[n]
+            continue
+        all_s = sum(s for _, s in calls) or 1e-9
+        hit_s = sum(s for f, s in calls if f & changed)
+        total += maps.secs[n] * hit_s / all_s + 0.01  # the rest of the test body still runs
+    return total
+
+
 def passing_here(sel, overrides, repo, maps, notes):
     """The selected tests that pass when run here against the patched source,
     when running them costs less than leaving them out saves (app/run_tests.py)."""
@@ -1128,9 +1176,12 @@ def passing_here(sel, overrides, repo, maps, notes):
         return set()
     ids = {t["number"]: t["id"] for t in maps.tests}
     files = {t["number"]: t["file"] for t in maps.tests}
-    if not all(run_tests.runnable(ids[n]) and files[n] not in RUN_SKIP_FILES for n in sel) \
-            or maps.seconds(sel) > RUN_MAX_S:
+    if not all(run_tests.runnable(ids[n]) and files[n] not in RUN_SKIP_FILES for n in sel):
         return set()  # the commit would still need a worker: running buys little
+    bodies = body_only_changes(overrides, repo, maps)
+    estimate = run_estimate(sel, bodies, maps) if bodies else maps.seconds(sel)
+    if estimate > (RUN_MAX_S if bodies else RUN_MAX_FULL_S):
+        return set()
 
     def cost(nums):
         dur = {n: int(maps.secs[n] * 1000 + 0.5) for n in nums}
@@ -1143,10 +1194,10 @@ def passing_here(sel, overrides, repo, maps, notes):
     request = {"tests": [ids[n] for n in sorted(sel)], "seconds": {ids[n]: maps.secs[n] for n in sel},
                "first": first}
     timeout = RUN_TIMEOUT_S + 5 * maps.seconds(sel)
-    result, bodies = None, body_only_changes(overrides, repo, maps)
-    if bodies:  # cheap: the shared server swaps the new bodies in
+    result = None
+    if bodies:  # cheap: the shared server swaps the new bodies in, skips unaffected calls
         result = _server_call(repo, dict(request, files={p: overrides[p] for p in bodies},
-                                         functions=bodies), timeout, notes)
+                                         functions=bodies, skip_calls=True), timeout, notes)
         if result is not None:
             result["ok"] = True
     if result is None:  # the commit's own patched worker
@@ -1155,5 +1206,6 @@ def passing_here(sel, overrides, repo, maps, notes):
         return set()
     by_id = {v: k for k, v in ids.items()}
     passed = {by_id[t] for t in result.get("passed", ()) if t in by_id}
-    notes.append(("ran here", len(sel), "passed", len(passed), "failed", len(result.get("failed", ()))))
+    notes.append(("ran here", len(sel), "passed", len(passed), "failed", len(result.get("failed", ())),
+                  "est %.2f" % estimate, "cpu %s" % result.get("cpu"), "calls %s" % result.get("calls")))
     return passed

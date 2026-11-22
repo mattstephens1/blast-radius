@@ -68,6 +68,9 @@ def _threads_for_pools():
     mp.Pool = mpp.ThreadPool
 
 
+CURRENT = {"test": None, "counts": None}  # the test being run (for call-level skipping)
+
+
 class _TimeLimit(Exception):
     pass
 
@@ -89,14 +92,17 @@ class _Result(unittest.TestResult):
             self.stop()  # one failure fails the commit: nothing more to learn
 
     limits = {}
+    test_ids = {}
 
     def startTest(self, test):
         super().startTest(test)
         self.ran.add(self._id(test))
+        CURRENT["test"], CURRENT["counts"] = self.test_ids.get(self._id(test)), {}
         signal.setitimer(signal.ITIMER_REAL, self.limits.get(self._id(test), 5.0))
 
     def stopTest(self, test):
         signal.setitimer(signal.ITIMER_REAL, 0)
+        CURRENT["test"], CURRENT["counts"] = None, None
         super().stopTest(test)
 
     def addError(self, test, err):
@@ -147,6 +153,7 @@ def run_here(test_ids, seconds, first=()):
         raise _TimeLimit()
 
     result.limits = {case.id(): max(5.0, 5 * seconds.get(tid, 0)) for tid, case in cases}
+    result.test_ids = {case.id(): tid for tid, case in cases}
     # one suite per class (so setUpClass runs once), cheapest classes first
     classes = {}
     for tid, case in cases:
