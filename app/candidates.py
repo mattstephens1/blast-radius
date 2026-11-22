@@ -32,10 +32,12 @@ TPC_TESTS = {
 # verified against real test runs, so off
 NAME_NARROW = False
 RUN_TESTS = Path(__file__).resolve().with_name("run_tests.py")
-# Run small selections here (app/run_tests.py, in the commit's patched worker) and
-# leave out the tests that pass. A practice-board diagnostic found ~11 of ~38 cheap
-# commits fail nothing; their few tests cost ~2.5 s of workers each. RUN_TESTS=0: off.
-RUN_ENABLED = os.environ.get("RUN_TESTS", "1") == "1"
+# Run small selections here (app/run_tests.py, the shared test server or the commit's
+# worker) and leave out the tests that pass. Sound (161 + 232 dropped tests confirmed
+# by pytest), but on the practice board the scorer runs tests at ~1.5-2x their
+# recorded time, so it cost about what it saved (v21: -7.4 s simulated, +11.6 s CPU;
+# v22: -4.5 / +5.3). Off by default; RUN_TESTS=1 turns it on.
+RUN_ENABLED = os.environ.get("RUN_TESTS", "0") == "1"
 RUN_MAX_S = float(os.environ.get("RUN_MAX_S", "0.6"))  # run selections taking at most this long...
 RUN_WORTH_S = 2.0   # ...and leaving them all out would save at least this much
 RUN_TIMEOUT_S = 30  # on top of 5x the tests' recorded time
