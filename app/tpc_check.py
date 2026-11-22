@@ -177,8 +177,12 @@ def duck_results(fixtures, suite, sqls, conns):
         d = os.path.join(fixtures, "optimizer", SUITES[suite].split("/")[0]) + "/"
         conn = duckdb.connect()
         for table, columns in schema.items():
-            conn.execute("CREATE VIEW %s AS SELECT * FROM READ_CSV('%s%s.csv.gz', delim='|', "
+            # the tests' setUpClass makes these views over the CSV files; each query
+            # through a view re-reads the files, so the check loads each table once
+            # into a table with the same rows and column types
+            conn.execute("CREATE VIEW csv_%s AS SELECT * FROM READ_CSV('%s%s.csv.gz', delim='|', "
                          "header=True, columns=%s)" % (table, d, table, columns))
+            conn.execute("CREATE TABLE %s AS SELECT * FROM csv_%s" % (table, table))
         conns[suite] = conn
     out = []
     for sql in sqls:
@@ -189,6 +193,71 @@ def duck_results(fixtures, suite, sqls, conns):
             text = "error " + type(error).__name__ + " " + str(error)[:200]
         out.append(hashlib.blake2b(text.encode(), digest_size=16).hexdigest())
     return out
+
+
+def _duck_conn(fixtures, suite, conns):
+    import duckdb
+    if suite not in conns:
+        _, helpers = _queries(fixtures, suite)
+        schema = helpers.TPCDS_SCHEMA if suite == "tpcds" else helpers.TPCH_SCHEMA
+        d = os.path.join(fixtures, "optimizer", SUITES[suite].split("/")[0]) + "/"
+        conn = duckdb.connect()
+        for table, columns in schema.items():
+            conn.execute("CREATE VIEW csv_%s AS SELECT * FROM READ_CSV('%s%s.csv.gz', delim='|', "
+                         "header=True, columns=%s)" % (table, d, table, columns))
+            conn.execute("CREATE TABLE %s AS SELECT * FROM csv_%s" % (table, table))
+        conns[suite] = conn
+    return conns[suite]
+
+
+def assertion_holds(fixtures, key, duck_sqls, table_cache, conns, pd_cache):
+    """The tests' own assertion for one changed query, on the patched code:
+    test_execute_tpcds compares DuckDB's answer for the DuckDB SQL with what
+    sqlglot's executor returns (as DataFrames, assert_frame_equal(check_dtype=
+    False, check_index_type=False)); test_optimized_tpch compares DuckDB's answers
+    for the query and for its optimized form. False if it fails or cannot run."""
+    try:
+        import numpy as np
+        import pandas as pd
+        from pandas.testing import assert_frame_equal
+    except ImportError:
+        return False
+    suite, i = key.split()[0], int(key.split()[1])
+    conn = _duck_conn(fixtures, suite, conns)
+    try:
+        a = conn.execute(duck_sqls[0]).fetchdf()
+        if suite == "tpch":
+            b = conn.execute(duck_sqls[1]).fetchdf()
+            for j, column in enumerate(b.columns):  # rename_anonymous(b, a)
+                if "_col_" in column:
+                    b.rename(columns={column: a.columns[j]}, inplace=True)
+            assert_frame_equal(a, b)
+            return True
+        table = executed_table(fixtures, suite, i, table_cache)
+        b = pd.DataFrame(((np.nan if c is None else c for c in r) for r in table.rows), columns=table.columns)
+        assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
+        return True
+    except Exception:
+        return False
+
+
+def executed_table(fixtures, suite, i, cache):
+    """What the tests' process-pool worker returns for query i: the parse and the
+    tables pickled in, sqlglot's executor run, the result pickled back."""
+    from sqlglot import find_tables, parse_one
+    from sqlglot.executor import execute
+    queries, helpers = _queries(fixtures, suite)
+    schema = helpers.TPCDS_SCHEMA if suite == "tpcds" else helpers.TPCH_SCHEMA
+    _, sql, _ = queries[i]
+    e = parse_one(sql)
+    names = [t.name for t in find_tables(e)]
+    for n in names:
+        if (suite, n) not in cache:
+            loaded = _load_tables(fixtures, suite, [n])[n]
+            cache[(suite, n)] = pickle.loads(pickle.dumps(loaded))
+    table = execute(pickle.loads(pickle.dumps(e)), schema=pickle.loads(pickle.dumps(schema)),
+                    tables={n: cache[(suite, n)] for n in names})
+    return pickle.loads(pickle.dumps(table))
 
 
 def results(fixtures, suite, keys, cache):
@@ -513,42 +582,57 @@ def check(fixtures, path, suites, only=None, execute_keys=()):
 
         started = time.process_time()
 
+        pd_cache = {}
+
         def stop(key, value):
-            """A differing preparation only matters if the DuckDB SQL differs or the
-            executor's result on the real data does: run just this query to see."""
+            """Does this query change the outcome of a TPC test? Its preparation
+            differing only matters through what the tests assert."""
             if time.process_time() - started > TOTAL_BUDGET_S:
                 why[key] = "budget"
                 really.add(key)  # too slow to tell (a pathological patch): keep the tests
                 return True
             if fp.get(key) == value:
                 return False
-            if base_duck.get(key) is None or duck.get(key) != base_duck.get(key):
-                # the DuckDB SQL changed: what matters is what DuckDB returns for it
-                got = None
-                if key in base_duckres and key in duck_sql:
-                    got = duck_results(fixtures, key.split()[0], duck_sql[key], conns)
-                if got is None or got != base_duckres[key]:
-                    why[key] = "duck sql" if got is None else "duck result"
-                    really.add(key)
-                    return True
             if parsed.get(key) == "error" or base_parsed.get(key) is None:
                 why[key] = "pickle fails"
-                really.add(key)  # every query is pickled to the process pool: a failure
-                return True      # there crashes the pool and fails the whole test
-            # a query the tests do not execute only travels to the pool and back: its
-            # parse may print differently, as long as the round trip works (checked
-            # above). Executed queries are judged by their results below.
-            if key in base_res:
+                really.add(key)  # every query is pickled to the tests' process pool:
+                return True      # a failure there crashes the pool and fails the test
+            suite = key.split()[0]
+            same_duck = base_duck.get(key) is not None and duck.get(key) == base_duck.get(key)
+            if suite == "tpch":
+                # test_execute_tpch executes none of its queries (only the pool trip
+                # above); test_optimized_tpch compares DuckDB answers
+                if same_duck:
+                    return False
+                if key in duck_sql and assertion_holds(fixtures, key, duck_sql[key], cache, conns, pd_cache):
+                    return False
+                why[key] = "optimized assertion"
+                really.add(key)
+                return True
+            if key not in base_res:
+                return False  # a TPC-DS query the test does not execute: only the pool trip
+            if same_duck:
                 t = time.process_time()
-                same = results(fixtures, key.split()[0], [key], cache)[key] == base_res[key]
+                same = results(fixtures, suite, [key], cache)[key] == base_res[key]
                 done.add(key)
                 executed[0] += 1
                 executed[1] += time.process_time() - t
-                if not same or executed[1] > EXECUTE_BUDGET_S:
-                    why[key] = "result" if not same else "execute budget"
-                    really.add(key)
-                    return True
-            return False
+                if same:
+                    return False
+            if executed[1] > EXECUTE_BUDGET_S:
+                why[key] = "execute budget"
+                really.add(key)
+                return True
+            t = time.process_time()
+            holds = key in duck_sql and assertion_holds(fixtures, key, duck_sql[key], cache, conns, pd_cache)
+            done.add(key)
+            executed[0] += 1
+            executed[1] += time.process_time() - t
+            if holds:
+                return False
+            why[key] = "assertion"
+            really.add(key)
+            return True
 
         now = fingerprints(fixtures, suites, stop=stop, only=only, duck=duck, parsed=parsed,
                            duck_sql_out=duck_sql)
